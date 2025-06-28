@@ -82,6 +82,9 @@ def generate_calibration_data(pipe, args, calibration_dir):
     )
 
     os.makedirs(calibration_dir, exist_ok=True)
+    for f in os.listdir(calibration_dir):
+        if f.endswith(".pkl"):
+            os.remove(os.path.join(calibration_dir, f))
 
     prompts = CALIBRATION_DATA if not getattr(args, "test", False) else CALIBRATION_DATA[:1]
 
@@ -162,6 +165,14 @@ def quantize_cumulative_config(skip_conv_layers, skip_einsum_layers):
     return config
 
 
+def _to_coreml_unet_inputs(sample, timestep, encoder_hidden_states):
+    if len(timestep.shape) == 0:
+        timestep = timestep[None]
+    timestep = timestep.expand(sample.shape[0])
+    encoder_hidden_states = encoder_hidden_states.permute(0, 2, 1).unsqueeze(2)
+    return sample, timestep, encoder_hidden_states
+
+
 def quantize(model, config, calibration_data):
     """Post training activation quantization using calibration data."""
 
@@ -172,7 +183,7 @@ def quantize(model, config, calibration_data):
     config.non_traceable_module_names = non_traceable
     config.preserved_attributes = ["config", "device"]
 
-    sample_input = calibration_data[0]
+    sample_input = _to_coreml_unet_inputs(*calibration_data[0])
     quantizer = LinearQuantizer(model, config)
     logger.info("Preparing model for quantization")
     prepared_model = quantizer.prepare(example_inputs=(sample_input,))
@@ -182,7 +193,7 @@ def quantize(model, config, calibration_data):
     logger.info("Calibrate")
     for idx, data in enumerate(calibration_data):
         logger.info(f"Calibration data sample: {idx}")
-        prepared_model(*data)
+        prepared_model(*_to_coreml_unet_inputs(*data))
 
     logger.info("Finalize model")
     quantized_model = quantizer.finalize()
@@ -220,7 +231,18 @@ def convert_quantized_unet(pipe, args):
     # Quantize UNet weights and activations (W8A8 by default)
     config = quantize_cumulative_config(set(), set())
     logger.info("Quantizing UNet model")
-    quant_unet = quantize(pipe.unet, config, dataloader)
+
+    if args.xl_version:
+        unet_cls = unet_mod.UNet2DConditionModelXL
+    else:
+        unet_cls = unet_mod.UNet2DConditionModel
+
+    reference_unet = unet_cls(
+        support_controlnet=args.unet_support_controlnet, **pipe.unet.config
+    ).eval()
+    reference_unet.load_state_dict(pipe.unet.state_dict())
+
+    quant_unet = quantize(reference_unet, config, dataloader)
     if torch.backends.mps.is_available():
         quant_unet.to("mps")
     elif torch.cuda.is_available():
