@@ -263,12 +263,18 @@ def generate_calibration_data(pipe, args, calibration_dir):
     # If directory doesn't exist, create it
     os.makedirs(calibration_dir, exist_ok=True)
 
+    pipe.scheduler.set_timesteps(4)
+    pipe.scheduler.timesteps = torch.tensor(
+        [999, 749, 499, 249], device=pipe.scheduler.timesteps.device
+    )
+
     # Run calibration prompts through the pipeline and
     # serialize recorded UNet model inputs
-    for prompt in CALIBRATION_DATA:
+    prompts = CALIBRATION_DATA if not getattr(args, "test", False) else CALIBRATION_DATA[:1]
+    for prompt in prompts:
         gen = torch.manual_seed(args.seed)
         # run forward pass
-        pipe(prompt=prompt, generator=gen)
+        pipe(prompt=prompt, generator=gen, num_inference_steps=4, guidance_scale=0)
         # save unet inputs
         filename = "_".join(prompt.split(" ")) + "_" + str(args.seed) + ".pkl"
         filepath = os.path.join(calibration_dir, filename)
@@ -488,6 +494,9 @@ if __name__ == "__main__":
                         type=int,
                         help="Random seed to be able to reproduce results"
     )
+    parser.add_argument("--test",
+                        action="store_true",
+                        help="Run calibration data generation on a single prompt")
     parser.add_argument("--conv-psnr",
                         default=40.0,
                         type=float,
