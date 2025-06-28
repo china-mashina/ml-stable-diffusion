@@ -76,10 +76,18 @@ def generate_calibration_data(pipe, args, calibration_dir):
     unet_inputs = []
     handle = register_input_log_hook(pipe.unet, unet_inputs)
 
+    pipe.scheduler.set_timesteps(4)
+    pipe.scheduler.timesteps = torch.tensor(
+        [999, 749, 499, 249], device=pipe.scheduler.timesteps.device
+    )
+
     os.makedirs(calibration_dir, exist_ok=True)
-    for prompt in CALIBRATION_DATA:
+
+    prompts = CALIBRATION_DATA if not getattr(args, "test", False) else CALIBRATION_DATA[:1]
+
+    for prompt in prompts:
         gen = torch.manual_seed(args.seed)
-        pipe(prompt=prompt, generator=gen)
+        pipe(prompt=prompt, generator=gen, num_inference_steps=4, guidance_scale=0)
         filename = "_".join(prompt.split(" ")) + "_" + str(args.seed) + ".pkl"
         filepath = os.path.join(calibration_dir, filename)
         with open(filepath, "wb") as f:
@@ -374,6 +382,11 @@ def parser_spec():
     )
     parser.add_argument(
         "--seed", "-s", default=50, type=int, help="Random seed for calibration prompts"
+    )
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Run calibration data generation on a single prompt",
     )
     return parser
 
