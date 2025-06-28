@@ -663,12 +663,15 @@ class TimestepEmbedding(nn.Module):
             self.post_act = get_activation(post_act_fn)
 
     def forward(self, sample, condition=None):
-        if sample.dim() == 2:
-            sample = sample.unsqueeze(-1).unsqueeze(-1)
+        # `sample` and optional `condition` are expected to be 2-D tensors of
+        # shape (batch, channels). During quantization tracing these tensors are
+        # `Proxy` objects, which do not support boolean checks such as
+        # `sample.dim() == 2`. Instead of branching on their dimensionality we
+        # directly reshape them to the 4-D layout expected by Conv2d layers.
+        sample = sample.unsqueeze(-1).unsqueeze(-1)
 
         if condition is not None:
-            if condition.dim() == 2:
-                condition = condition.unsqueeze(-1).unsqueeze(-1)
+            condition = condition.unsqueeze(-1).unsqueeze(-1)
             sample = sample + self.cond_proj(condition)
         sample = self.linear_1(sample)
 
