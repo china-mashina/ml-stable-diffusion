@@ -286,6 +286,9 @@ def convert_quantized_unet(pipe, args):
         support_controlnet=args.unet_support_controlnet, **pipe.unet.config
     ).eval()
     reference_unet.load_state_dict(pipe.unet.state_dict())
+    # Delete original UNet to reclaim memory
+    del pipe.unet
+    gc.collect()
 
     # Quantization must run on CPU. Move the reference model and calibration
     # data to CPU and run quantization there, then move the quantized model back
@@ -301,6 +304,9 @@ def convert_quantized_unet(pipe, args):
     _log_device("Reference UNet", reference_unet)
 
     quant_unet = quantize(reference_unet, config, dataloader)
+    # reference_unet and calibration data are no longer needed
+    del reference_unet, dataloader
+    gc.collect()
     quant_unet.to(run_device)
     _log_device("Quantized UNet", quant_unet)
 
@@ -313,12 +319,20 @@ def convert_quantized_unet(pipe, args):
         args.latent_w or quant_unet.config.sample_size,
     )
 
+    te2_hidden_size = None
     if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
         text_token_sequence_length = pipe.text_encoder.config.max_position_embeddings
         hidden_size = pipe.text_encoder.config.hidden_size
+        if hasattr(pipe, "text_encoder_2") and pipe.text_encoder_2 is not None:
+            te2_hidden_size = pipe.text_encoder_2.config.hidden_size
+            del pipe.text_encoder_2
+        del pipe.text_encoder
     else:
         text_token_sequence_length = pipe.text_encoder_2.config.max_position_embeddings
         hidden_size = pipe.text_encoder_2.config.hidden_size
+        te2_hidden_size = pipe.text_encoder_2.config.hidden_size
+        del pipe.text_encoder_2
+    gc.collect()
 
     encoder_hidden_states_shape = (
         batch_size,
@@ -351,7 +365,7 @@ def convert_quantized_unet(pipe, args):
         time_ids = [add_neg_time_ids, add_time_ids]
         text_embeds_shape = (
             batch_size,
-            pipe.text_encoder_2.config.hidden_size,
+            te2_hidden_size,
         )
         additional = OrderedDict(
             [
@@ -453,6 +467,8 @@ def main(args):
 
     if args.convert_unet:
         convert_quantized_unet(pipe, args)
+        del pipe
+        gc.collect()
 
     if args.quantize_nbits is not None:
         torch2coreml.quantize_weights(args)
