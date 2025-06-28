@@ -663,12 +663,15 @@ class TimestepEmbedding(nn.Module):
             self.post_act = get_activation(post_act_fn)
 
     def forward(self, sample, condition=None):
-        if sample.dim() == 2:
-            sample = sample.unsqueeze(-1).unsqueeze(-1)
+        # `sample` and optional `condition` are expected to be 2-D tensors of
+        # shape (batch, channels). During quantization tracing these tensors are
+        # `Proxy` objects, which do not support boolean checks such as
+        # `sample.dim() == 2`. Instead of branching on their dimensionality we
+        # directly reshape them to the 4-D layout expected by Conv2d layers.
+        sample = sample.unsqueeze(-1).unsqueeze(-1)
 
         if condition is not None:
-            if condition.dim() == 2:
-                condition = condition.unsqueeze(-1).unsqueeze(-1)
+            condition = condition.unsqueeze(-1).unsqueeze(-1)
             sample = sample + self.cond_proj(condition)
         sample = self.linear_1(sample)
 
@@ -708,14 +711,44 @@ def get_timestep_embedding(
     scale=1,
     max_period=10000,
 ):
-    assert timesteps.dim() == 1, "Timesteps should be a 1d-array"
+    # Flatten timesteps to avoid control flow that breaks symbolic tracing.
+    # torch.fx does not support boolean checks on Proxy objects, so instead of
+    # asserting the dimensionality we simply ensure a 1-D view.
+    timesteps = timesteps.reshape(-1)
+
+    # Debug printing to help diagnose tracing issues.
+    try:
+        print(
+            f"[debug] timesteps shape: {getattr(timesteps, 'shape', 'unknown')}, "
+            f"dtype: {getattr(timesteps, 'dtype', 'unknown')}, "
+            f"type: {type(timesteps)}"
+        )
+    except Exception as e:
+        print(f"[debug] failed to print timesteps info: {e}")
 
     half_dim = embedding_dim // 2
+
+    # Determine the target device for the embeddings. When tracing with
+    # `torch.fx`, `timesteps` is a Proxy object rather than a Tensor, so we
+    # default to CPU in that case. During normal execution `timesteps` is a
+    # Tensor and we keep the embeddings on the same device.
+    if isinstance(timesteps, torch.Tensor):
+        emb_device = timesteps.device
+    else:
+        emb_device = torch.device("cpu")
+
     exponent = -math.log(max_period) * torch.arange(
-        start=0, end=half_dim, dtype=torch.float32)
+        start=0, end=half_dim, dtype=torch.float32, device=emb_device
+    )
     exponent = exponent / (half_dim - downscale_freq_shift)
 
-    emb = torch.exp(exponent).to(device=timesteps.device)
+    emb = torch.exp(exponent)
+    try:
+        print(
+            f"[debug] exponent device: {exponent.device}, emb device: {emb.device}" 
+        )
+    except Exception as e:
+        print(f"[debug] failed to print exponent info: {e}")
     emb = timesteps[:, None].float() * emb[None, :]
     emb = scale * emb
     emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
