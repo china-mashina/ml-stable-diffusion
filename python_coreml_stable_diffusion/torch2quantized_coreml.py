@@ -89,6 +89,11 @@ def register_input_log_hook(unet, inputs):
         for key in ["encoder_hidden_states", "time_ids", "text_embeds"]:
             if key in kwargs:
                 collected.append(kwargs[key])
+        if "added_cond_kwargs" in kwargs:
+            added = kwargs["added_cond_kwargs"]
+            for k in ["time_ids", "text_embeds"]:
+                if isinstance(added, dict) and k in added:
+                    collected.append(added[k])
 
         input_copy = tuple(
             i.detach().to("cpu") if torch.is_tensor(i) else i for i in collected
@@ -201,12 +206,28 @@ def quantize_cumulative_config(skip_conv_layers, skip_einsum_layers):
     return config
 
 
-def _to_coreml_unet_inputs(sample, timestep, encoder_hidden_states):
+def _to_coreml_unet_inputs(
+    sample,
+    timestep,
+    encoder_hidden_states,
+    time_ids=None,
+    text_embeds=None,
+):
+    """Normalize UNet inputs for Core ML conversion.
+
+    ``time_ids`` and ``text_embeds`` are optional and used by SDXL models.
+    They are forwarded as-is if provided.
+    """
+
     if len(timestep.shape) == 0:
         timestep = timestep[None]
     timestep = timestep.expand(sample.shape[0])
     encoder_hidden_states = encoder_hidden_states.permute(0, 2, 1).unsqueeze(2)
-    return sample, timestep, encoder_hidden_states
+
+    inputs = [sample, timestep, encoder_hidden_states]
+    if time_ids is not None or text_embeds is not None:
+        inputs.extend([time_ids, text_embeds])
+    return tuple(inputs)
 
 
 def quantize(model, config, calibration_data):
