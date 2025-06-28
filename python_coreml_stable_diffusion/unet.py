@@ -105,7 +105,7 @@ class CrossAttention(nn.Module):
             elif mask.dtype != torch.float32:
                 raise TypeError(f"Unexpected dtype for mask: {mask.dtype}")
 
-            if len(mask.size()) == 2:
+            if mask.dim() == 2:
                 mask = mask.unsqueeze(2).unsqueeze(2)
 
             if list(mask.size()) != expected_mask_shape:
@@ -663,11 +663,11 @@ class TimestepEmbedding(nn.Module):
             self.post_act = get_activation(post_act_fn)
 
     def forward(self, sample, condition=None):
-        if len(sample.shape) == 2:
+        if sample.dim() == 2:
             sample = sample.unsqueeze(-1).unsqueeze(-1)
 
         if condition is not None:
-            if len(condition.shape) == 2:
+            if condition.dim() == 2:
                 condition = condition.unsqueeze(-1).unsqueeze(-1)
             sample = sample + self.cond_proj(condition)
         sample = self.linear_1(sample)
@@ -708,7 +708,7 @@ def get_timestep_embedding(
     scale=1,
     max_period=10000,
 ):
-    assert len(timesteps.shape) == 1, "Timesteps should be a 1d-array"
+    assert timesteps.dim() == 1, "Timesteps should be a 1d-array"
 
     half_dim = embedding_dim // 2
     exponent = -math.log(max_period) * torch.arange(
