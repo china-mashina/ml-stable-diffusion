@@ -135,10 +135,8 @@ def generate_calibration_data(pipe, args, calibration_dir):
     handle.remove()
 
 
-def unet_data_loader(data_dir, device=None, calibration_nsamples=None):
+def unet_data_loader(data_dir, device="cpu", calibration_nsamples=None):
     """Load serialized UNet inputs from calibration directory."""
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
 
     dataloader = []
     skip_load = False
@@ -273,8 +271,10 @@ def _prepare_calibration(pipe, args, calib_dir):
     if args.generate_calibration_data or not os.path.exists(calib_dir):
         logger.info("Generating calibration data for activation quantization")
         generate_calibration_data(pipe, args, calib_dir)
-    # Prefer CUDA for calibration data if available, otherwise fallback to CPU
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Quantization is only supported on CPU or single-device CUDA modules.
+    # Loading calibration samples on CPU avoids device mismatch errors during
+    # preparation.
+    device = "cpu"
     dataloader = unet_data_loader(calib_dir, device, args.calibration_nsamples)
     if dataloader:
         for i, t in enumerate(dataloader[0]):
@@ -333,12 +333,13 @@ def convert_quantized_unet(pipe, args):
     config = quantize_cumulative_config(set(), set())
     logger.info("Quantizing UNet model")
 
-    # Prefer CUDA for quantization if available, otherwise fall back to CPU.
-    quant_device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Quantization must run on CPU. After quantization, move the resulting model
+    # to the preferred runtime device (CUDA > MPS > CPU).
+    quant_device = "cpu"
     run_device = (
-        "cuda"
-        if torch.cuda.is_available()
-        else "mps" if torch.backends.mps.is_available() else "cpu"
+        "mps"
+        if torch.backends.mps.is_available()
+        else "cuda" if torch.cuda.is_available() else "cpu"
     )
 
     reference_unet.to(quant_device)
