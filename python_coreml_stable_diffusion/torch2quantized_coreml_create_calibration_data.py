@@ -17,10 +17,10 @@ def main(args):
     os.makedirs(args.o, exist_ok=True)
 
     pipe = torch2coreml.get_pipeline(args)
-    if torch.backends.mps.is_available():
-        pipe.to(device="mps", dtype=torch.float32)
-    elif torch.cuda.is_available():
+    if torch.cuda.is_available():
         pipe.to(device="cuda", dtype=torch.float32)
+    elif torch.backends.mps.is_available():
+        pipe.to(device="mps", dtype=torch.float32)
     else:
         pipe.to(device="cpu", dtype=torch.float32)
 
