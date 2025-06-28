@@ -92,6 +92,9 @@ def generate_calibration_data(pipe, args, calibration_dir):
 def unet_data_loader(data_dir, device="cpu", calibration_nsamples=None):
     """Load serialized UNet inputs from calibration directory."""
 
+    if device == "cpu" and torch.backends.mps.is_available():
+        device = "mps"
+
     dataloader = []
     skip_load = False
     for file in sorted(os.listdir(data_dir)):
@@ -102,7 +105,7 @@ def unet_data_loader(data_dir, device="cpu", calibration_nsamples=None):
                     while not skip_load:
                         unet_data = pickle.load(data)
                         for inp in unet_data:
-                            dataloader.append([x.to(torch.float).to(device) for x in inp])
+                            dataloader.append([x.to(torch.float32).to(device) for x in inp])
                             if calibration_nsamples and len(dataloader) >= calibration_nsamples:
                                 skip_load = True
                                 break
@@ -184,7 +187,12 @@ def _prepare_calibration(pipe, args, calib_dir):
     if args.generate_calibration_data or not os.path.exists(calib_dir):
         logger.info("Generating calibration data for activation quantization")
         generate_calibration_data(pipe, args, calib_dir)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if torch.backends.mps.is_available():
+        device = "mps"
+    elif torch.cuda.is_available():
+        device = "cuda"
+    else:
+        device = "cpu"
     return unet_data_loader(calib_dir, device, args.calibration_nsamples)
 
 
@@ -205,7 +213,12 @@ def convert_quantized_unet(pipe, args):
     config = quantize_cumulative_config(set(), set())
     logger.info("Quantizing UNet model")
     quant_unet = quantize(pipe.unet, config, dataloader)
-    quant_unet.to("cpu")
+    if torch.backends.mps.is_available():
+        quant_unet.to("mps")
+    elif torch.cuda.is_available():
+        quant_unet.to("cuda")
+    else:
+        quant_unet.to("cpu")
 
     # Prepare sample input shapes
     batch_size = 1 if args.unet_batch_one else 2
@@ -234,9 +247,12 @@ def convert_quantized_unet(pipe, args):
 
     sample_inputs = OrderedDict(
         [
-            ("sample", torch.rand(*sample_shape)),
+            ("sample", torch.rand(*sample_shape, dtype=torch.float32)),
             ("timestep", torch.tensor([0] * batch_size).to(torch.float32)),
-            ("encoder_hidden_states", torch.rand(*encoder_hidden_states_shape)),
+            (
+                "encoder_hidden_states",
+                torch.rand(*encoder_hidden_states_shape, dtype=torch.float32),
+            ),
         ]
     )
 
@@ -256,7 +272,10 @@ def convert_quantized_unet(pipe, args):
         additional = OrderedDict(
             [
                 ("time_ids", torch.tensor(time_ids).to(torch.float32)),
-                ("text_embeds", torch.rand(*text_embeds_shape)),
+                (
+                    "text_embeds",
+                    torch.rand(*text_embeds_shape, dtype=torch.float32),
+                ),
             ]
         )
         sample_inputs.update(additional)
@@ -267,9 +286,14 @@ def convert_quantized_unet(pipe, args):
     logger.info("JIT tracing quantized UNet")
     traced_unet = torch.jit.trace(quant_unet, list(sample_inputs.values()))
 
-    coreml_inputs = {k: v.numpy().astype(np.float16) for k, v in sample_inputs.items()}
+    coreml_inputs = {k: v.numpy().astype(np.float32) for k, v in sample_inputs.items()}
     coreml_unet, out_path = torch2coreml._convert_to_coreml(
-        "unet", traced_unet, coreml_inputs, ["noise_pred"], args
+        "unet",
+        traced_unet,
+        coreml_inputs,
+        ["noise_pred"],
+        args,
+        precision=ct.precision.FLOAT32,
     )
 
     coreml_unet.author = (
@@ -303,6 +327,12 @@ def main(args):
 
     # Load diffusers pipeline as in torch2coreml
     pipe = torch2coreml.get_pipeline(args)
+    if torch.backends.mps.is_available():
+        pipe.to(device="mps", dtype=torch.float32)
+    elif torch.cuda.is_available():
+        pipe.to(device="cuda", dtype=torch.float32)
+    else:
+        pipe.to(device="cpu", dtype=torch.float32)
 
     unet_mod.ATTENTION_IMPLEMENTATION_IN_EFFECT = unet_mod.AttentionImplementations[
         args.attention_implementation
