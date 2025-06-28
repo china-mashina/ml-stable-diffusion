@@ -708,7 +708,10 @@ def get_timestep_embedding(
     scale=1,
     max_period=10000,
 ):
-    assert timesteps.dim() == 1, "Timesteps should be a 1d-array"
+    # Flatten timesteps to avoid control flow that breaks symbolic tracing.
+    # torch.fx does not support boolean checks on Proxy objects, so instead of
+    # asserting the dimensionality we simply ensure a 1-D view.
+    timesteps = timesteps.reshape(-1)
 
     half_dim = embedding_dim // 2
     exponent = -math.log(max_period) * torch.arange(
