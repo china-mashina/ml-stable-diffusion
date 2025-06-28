@@ -727,12 +727,21 @@ def get_timestep_embedding(
         print(f"[debug] failed to print timesteps info: {e}")
 
     half_dim = embedding_dim // 2
+
+    # Determine the target device for the embeddings. When tracing with
+    # `torch.fx`, `timesteps` is a Proxy object rather than a Tensor, so we
+    # default to CPU in that case. During normal execution `timesteps` is a
+    # Tensor and we keep the embeddings on the same device.
+    if isinstance(timesteps, torch.Tensor):
+        emb_device = timesteps.device
+    else:
+        emb_device = torch.device("cpu")
+
     exponent = -math.log(max_period) * torch.arange(
-        start=0, end=half_dim, dtype=torch.float32)
+        start=0, end=half_dim, dtype=torch.float32, device=emb_device
+    )
     exponent = exponent / (half_dim - downscale_freq_shift)
 
-    # Avoid using `timesteps.device` here as it may be a Proxy during symbolic
-    # tracing, which cannot be passed as a device argument.
     emb = torch.exp(exponent)
     try:
         print(
