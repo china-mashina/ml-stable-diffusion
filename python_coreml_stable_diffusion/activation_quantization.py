@@ -320,7 +320,11 @@ def run_pipe(pipe):
         output_type="latent",
         generator=gen,
     )
-    return np.array([latent.cpu().numpy() for latent in pipe(**kwargs).images])
+    _log_device("Pipe.UNet", pipe.unet)
+    out = pipe(**kwargs)
+    if hasattr(out.images[0], "device"):
+        logger.info(f"Latent device: {out.images[0].device}")
+    return np.array([latent.cpu().numpy() for latent in out.images])
 
 
 def get_reference_pipeline(model_version):
@@ -345,15 +349,35 @@ def get_reference_pipeline(model_version):
     gc.collect()
     return ref_pipe
 
+def _log_device(name, obj):
+    """Utility to log the device of an object if available."""
+    dev = None
+    if hasattr(obj, "device"):
+        dev = obj.device
+    elif isinstance(obj, torch.nn.Module):
+        try:
+            dev = next(obj.parameters()).device
+        except StopIteration:
+            pass
+    if dev is not None:
+        logger.info(f"{name} device: {dev}")
+
+
 def main(args):
     # Initialize reference pipeline
     ref_pipe = get_reference_pipeline(args.model_version)
-    if torch.cuda.is_available():
+    if torch.backends.mps.is_available():
+        device = "mps"
+    elif torch.cuda.is_available():
         device = "cuda"
     else:
         device = "cpu"
     logger.debug(f"Placing pipe in {device}")
     ref_pipe.to(device)
+    _log_device("Pipeline", ref_pipe)
+    _log_device("UNet", ref_pipe.unet)
+    if getattr(ref_pipe, "text_encoder", None) is not None:
+        _log_device("TextEncoder", ref_pipe.text_encoder)
     # Generate baseline outputs
     ref_out = run_pipe(ref_pipe)
 
