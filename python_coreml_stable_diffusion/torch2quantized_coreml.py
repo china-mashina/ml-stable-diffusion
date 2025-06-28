@@ -218,6 +218,8 @@ def quantize(model, config, calibration_data):
     quantizer = LinearQuantizer(model, config)
     logger.info("Preparing model for quantization")
     prepared_model = quantizer.prepare(example_inputs=(sample_input,))
+    device = sample_input[0].device
+    prepared_model.to(device)
     _log_device("Prepared model", prepared_model)
     prepared_model.eval()
 
@@ -229,6 +231,7 @@ def quantize(model, config, calibration_data):
 
     logger.info("Finalize model")
     quantized_model = quantizer.finalize()
+    quantized_model.to(device)
     _log_device("Quantized model", quantized_model)
     return quantized_model
 
@@ -279,13 +282,12 @@ def convert_quantized_unet(pipe, args):
     ).eval()
     reference_unet.load_state_dict(pipe.unet.state_dict())
 
+    device = dataloader[0][0].device if dataloader else pipe.unet.device
+    reference_unet.to(device)
+    _log_device("Reference UNet", reference_unet)
+
     quant_unet = quantize(reference_unet, config, dataloader)
-    if torch.backends.mps.is_available():
-        quant_unet.to("mps")
-    elif torch.cuda.is_available():
-        quant_unet.to("cuda")
-    else:
-        quant_unet.to("cpu")
+    quant_unet.to(device)
     _log_device("Quantized UNet", quant_unet)
 
     # Prepare sample input shapes
