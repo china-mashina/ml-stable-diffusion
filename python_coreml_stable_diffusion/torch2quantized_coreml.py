@@ -48,6 +48,7 @@ def _log_device(name, obj):
     if dev is not None:
         logger.info(f"{name} device: {dev}")
 
+
 torch.set_grad_enabled(False)
 
 
@@ -113,7 +114,9 @@ def generate_calibration_data(pipe, args, calibration_dir):
         if f.endswith(".pkl"):
             os.remove(os.path.join(calibration_dir, f))
 
-    prompts = CALIBRATION_DATA if not getattr(args, "test", False) else CALIBRATION_DATA[:1]
+    prompts = (
+        CALIBRATION_DATA if not getattr(args, "test", False) else CALIBRATION_DATA[:1]
+    )
 
     for prompt in prompts:
         gen = torch.manual_seed(args.seed)
@@ -130,9 +133,6 @@ def generate_calibration_data(pipe, args, calibration_dir):
 def unet_data_loader(data_dir, device="cpu", calibration_nsamples=None):
     """Load serialized UNet inputs from calibration directory."""
 
-    if device == "cpu" and torch.backends.mps.is_available():
-        device = "mps"
-
     dataloader = []
     skip_load = False
     for file in sorted(os.listdir(data_dir)):
@@ -143,10 +143,17 @@ def unet_data_loader(data_dir, device="cpu", calibration_nsamples=None):
                     while not skip_load:
                         unet_data = pickle.load(data)
                         for inp in unet_data:
-                            dataloader.append([x.to(torch.float32).to(device) for x in inp])
+                            dataloader.append(
+                                [x.to(torch.float32).to(device) for x in inp]
+                            )
                             for i, t in enumerate(dataloader[-1]):
-                                _log_device(f"Loaded tensor device {len(dataloader)-1}_{i}", t)
-                            if calibration_nsamples and len(dataloader) >= calibration_nsamples:
+                                _log_device(
+                                    f"Loaded tensor device {len(dataloader)-1}_{i}", t
+                                )
+                            if (
+                                calibration_nsamples
+                                and len(dataloader) >= calibration_nsamples
+                            ):
                                 skip_load = True
                                 break
                 except EOFError:
@@ -206,7 +213,9 @@ def quantize(model, config, calibration_data):
     """Post training activation quantization using calibration data."""
 
     submodules = dict(model.named_modules(remove_duplicate=True))
-    layer_norm_modules = [key for key, val in submodules.items() if isinstance(val, LayerNormANE)]
+    layer_norm_modules = [
+        key for key, val in submodules.items() if isinstance(val, LayerNormANE)
+    ]
     non_traceable = layer_norm_modules + ["time_proj", "time_embedding"]
 
     config.non_traceable_module_names = non_traceable
@@ -236,18 +245,14 @@ def quantize(model, config, calibration_data):
     return quantized_model
 
 
-
 def _prepare_calibration(pipe, args, calib_dir):
     """Generate calibration data if needed and return dataloader."""
     if args.generate_calibration_data or not os.path.exists(calib_dir):
         logger.info("Generating calibration data for activation quantization")
         generate_calibration_data(pipe, args, calib_dir)
-    if torch.backends.mps.is_available():
-        device = "mps"
-    elif torch.cuda.is_available():
-        device = "cuda"
-    else:
-        device = "cpu"
+    # Quantization is only supported on CPU or CUDA. Always load calibration
+    # samples on CPU to avoid device mismatch errors during preparation.
+    device = "cpu"
     dataloader = unet_data_loader(calib_dir, device, args.calibration_nsamples)
     if dataloader:
         for i, t in enumerate(dataloader[0]):
@@ -282,12 +287,21 @@ def convert_quantized_unet(pipe, args):
     ).eval()
     reference_unet.load_state_dict(pipe.unet.state_dict())
 
-    device = dataloader[0][0].device if dataloader else pipe.unet.device
-    reference_unet.to(device)
+    # Quantization must run on CPU. Move the reference model and calibration
+    # data to CPU and run quantization there, then move the quantized model back
+    # to the desired runtime device afterwards.
+    quant_device = "cpu"
+    run_device = (
+        "mps"
+        if torch.backends.mps.is_available()
+        else "cuda" if torch.cuda.is_available() else "cpu"
+    )
+
+    reference_unet.to(quant_device)
     _log_device("Reference UNet", reference_unet)
 
     quant_unet = quantize(reference_unet, config, dataloader)
-    quant_unet.to(device)
+    quant_unet.to(run_device)
     _log_device("Quantized UNet", quant_unet)
 
     # Prepare sample input shapes
@@ -372,13 +386,13 @@ def convert_quantized_unet(pipe, args):
         precision=ct.precision.FLOAT32,
     )
 
-    coreml_unet.author = (
-        f"Please refer to the Model Card available at huggingface.co/{args.model_version}"
-    )
+    coreml_unet.author = f"Please refer to the Model Card available at huggingface.co/{args.model_version}"
     if args.xl_version:
         coreml_unet.license = "OpenRAIL++-M (https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/blob/main/LICENSE.md)"
     else:
-        coreml_unet.license = "OpenRAIL (https://huggingface.co/spaces/CompVis/stable-diffusion-license)"
+        coreml_unet.license = (
+            "OpenRAIL (https://huggingface.co/spaces/CompVis/stable-diffusion-license)"
+        )
     coreml_unet.version = args.model_version
     coreml_unet.short_description = (
         "Stable Diffusion generates images conditioned on text or other images as input through the diffusion process. "
@@ -427,9 +441,13 @@ def main(args):
     if args.convert_vae_encoder:
         torch2coreml.convert_vae_encoder(pipe, args)
     if args.convert_text_encoder and hasattr(pipe, "text_encoder"):
-        torch2coreml.convert_text_encoder(pipe.text_encoder, pipe.tokenizer, "text_encoder", args)
+        torch2coreml.convert_text_encoder(
+            pipe.text_encoder, pipe.tokenizer, "text_encoder", args
+        )
     if args.convert_text_encoder and hasattr(pipe, "text_encoder_2"):
-        torch2coreml.convert_text_encoder(pipe.text_encoder_2, pipe.tokenizer_2, "text_encoder_2", args)
+        torch2coreml.convert_text_encoder(
+            pipe.text_encoder_2, pipe.tokenizer_2, "text_encoder_2", args
+        )
     if args.convert_safety_checker:
         torch2coreml.convert_safety_checker(pipe, args)
 
