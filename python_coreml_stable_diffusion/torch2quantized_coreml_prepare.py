@@ -294,10 +294,8 @@ def convert_quantized_unet(pipe, args):
     )
     dataloader = _prepare_calibration(pipe, args, calib_dir)
 
-    # Quantize UNet weights and activations (W8A8 by default)
-    config = quantize_cumulative_config(set(), set())
-    logger.info("Quantizing UNet model")
-
+    # Create a reference UNet and gather text encoder metadata before
+    # releasing the pipeline to free memory.
     if args.xl_version:
         unet_cls = unet_mod.UNet2DConditionModelXL
     else:
@@ -307,9 +305,32 @@ def convert_quantized_unet(pipe, args):
         support_controlnet=args.unet_support_controlnet, **pipe.unet.config
     ).eval()
     reference_unet.load_state_dict(pipe.unet.state_dict())
-    # Delete original UNet to reclaim memory
+
+    if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
+        text_token_sequence_length = pipe.text_encoder.config.max_position_embeddings
+        hidden_size = pipe.text_encoder.config.hidden_size
+        if hasattr(pipe, "text_encoder_2") and pipe.text_encoder_2 is not None:
+            te2_hidden_size = pipe.text_encoder_2.config.hidden_size
+            del pipe.text_encoder_2
+        else:
+            te2_hidden_size = None
+        del pipe.text_encoder
+    else:
+        text_token_sequence_length = pipe.text_encoder_2.config.max_position_embeddings
+        hidden_size = pipe.text_encoder_2.config.hidden_size
+        te2_hidden_size = pipe.text_encoder_2.config.hidden_size
+        del pipe.text_encoder_2
+
+    # Delete pipeline UNet and drop the pipeline reference to free memory before
+    # quantization. The caller should ensure there are no remaining references
+    # to the pipeline after this call.
     del pipe.unet
+    del pipe
     gc.collect()
+
+    # Quantize UNet weights and activations (W8A8 by default)
+    config = quantize_cumulative_config(set(), set())
+    logger.info("Quantizing UNet model")
 
     # Quantization must run on CPU. Move the reference model and calibration
     # data to CPU and run quantization there, then move the quantized model back
@@ -340,20 +361,6 @@ def convert_quantized_unet(pipe, args):
         args.latent_w or quant_unet.config.sample_size,
     )
 
-    te2_hidden_size = None
-    if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
-        text_token_sequence_length = pipe.text_encoder.config.max_position_embeddings
-        hidden_size = pipe.text_encoder.config.hidden_size
-        if hasattr(pipe, "text_encoder_2") and pipe.text_encoder_2 is not None:
-            te2_hidden_size = pipe.text_encoder_2.config.hidden_size
-            del pipe.text_encoder_2
-        del pipe.text_encoder
-    else:
-        text_token_sequence_length = pipe.text_encoder_2.config.max_position_embeddings
-        hidden_size = pipe.text_encoder_2.config.hidden_size
-        te2_hidden_size = pipe.text_encoder_2.config.hidden_size
-        del pipe.text_encoder_2
-    gc.collect()
 
     encoder_hidden_states_shape = (
         batch_size,
@@ -522,7 +529,3 @@ def parser_spec():
     return parser
 
 
-if __name__ == "__main__":
-    parser = parser_spec()
-    args = parser.parse_args()
-    main(args)
