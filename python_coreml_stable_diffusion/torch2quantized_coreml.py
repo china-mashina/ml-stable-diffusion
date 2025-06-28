@@ -34,6 +34,20 @@ logging.basicConfig()
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+
+def _log_device(name, obj):
+    """Utility to log the device of an object if available."""
+    dev = None
+    if hasattr(obj, "device"):
+        dev = obj.device
+    elif isinstance(obj, torch.nn.Module):
+        try:
+            dev = next(obj.parameters()).device
+        except StopIteration:
+            pass
+    if dev is not None:
+        logger.info(f"{name} device: {dev}")
+
 torch.set_grad_enabled(False)
 
 
@@ -130,6 +144,8 @@ def unet_data_loader(data_dir, device="cpu", calibration_nsamples=None):
                         unet_data = pickle.load(data)
                         for inp in unet_data:
                             dataloader.append([x.to(torch.float32).to(device) for x in inp])
+                            for i, t in enumerate(dataloader[-1]):
+                                _log_device(f"Loaded tensor device {len(dataloader)-1}_{i}", t)
                             if calibration_nsamples and len(dataloader) >= calibration_nsamples:
                                 skip_load = True
                                 break
@@ -197,9 +213,12 @@ def quantize(model, config, calibration_data):
     config.preserved_attributes = ["config", "device"]
 
     sample_input = _to_coreml_unet_inputs(*calibration_data[0])
+    for i, t in enumerate(sample_input):
+        _log_device(f"Sample input tensor {i}", t)
     quantizer = LinearQuantizer(model, config)
     logger.info("Preparing model for quantization")
     prepared_model = quantizer.prepare(example_inputs=(sample_input,))
+    _log_device("Prepared model", prepared_model)
     prepared_model.eval()
 
     quantizer.step()
@@ -210,6 +229,7 @@ def quantize(model, config, calibration_data):
 
     logger.info("Finalize model")
     quantized_model = quantizer.finalize()
+    _log_device("Quantized model", quantized_model)
     return quantized_model
 
 
@@ -225,7 +245,11 @@ def _prepare_calibration(pipe, args, calib_dir):
         device = "cuda"
     else:
         device = "cpu"
-    return unet_data_loader(calib_dir, device, args.calibration_nsamples)
+    dataloader = unet_data_loader(calib_dir, device, args.calibration_nsamples)
+    if dataloader:
+        for i, t in enumerate(dataloader[0]):
+            _log_device(f"Calibration sample[0] tensor {i}", t)
+    return dataloader
 
 
 def convert_quantized_unet(pipe, args):
@@ -262,6 +286,7 @@ def convert_quantized_unet(pipe, args):
         quant_unet.to("cuda")
     else:
         quant_unet.to("cpu")
+    _log_device("Quantized UNet", quant_unet)
 
     # Prepare sample input shapes
     batch_size = 1 if args.unet_batch_one else 2
@@ -323,11 +348,17 @@ def convert_quantized_unet(pipe, args):
         )
         sample_inputs.update(additional)
 
+    # Ensure sample inputs are on the same device as the model
+    for k, v in sample_inputs.items():
+        sample_inputs[k] = v.to(quant_unet.device)
+        _log_device(f"Sample input {k}", sample_inputs[k])
+
     sample_inputs_spec = {k: (v.shape, v.dtype) for k, v in sample_inputs.items()}
     logger.info(f"Sample UNet inputs spec: {sample_inputs_spec}")
 
     logger.info("JIT tracing quantized UNet")
     traced_unet = torch.jit.trace(quant_unet, list(sample_inputs.values()))
+    _log_device("Traced UNet", traced_unet)
 
     coreml_inputs = {k: v.numpy().astype(np.float32) for k, v in sample_inputs.items()}
     coreml_unet, out_path = torch2coreml._convert_to_coreml(
@@ -376,6 +407,14 @@ def main(args):
         pipe.to(device="cuda", dtype=torch.float32)
     else:
         pipe.to(device="cpu", dtype=torch.float32)
+    _log_device("Pipeline", pipe)
+    _log_device("UNet", pipe.unet)
+    if getattr(pipe, "text_encoder", None) is not None:
+        _log_device("TextEncoder", pipe.text_encoder)
+    if getattr(pipe, "text_encoder_2", None) is not None:
+        _log_device("TextEncoder2", pipe.text_encoder_2)
+    if getattr(pipe, "vae", None) is not None:
+        _log_device("VAE", pipe.vae)
 
     unet_mod.ATTENTION_IMPLEMENTATION_IN_EFFECT = unet_mod.AttentionImplementations[
         args.attention_implementation
