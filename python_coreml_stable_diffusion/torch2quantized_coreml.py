@@ -59,15 +59,28 @@ CALIBRATION_DATA = [
 
 
 def register_input_log_hook(unet, inputs):
-    """Register forward pre hook to save model inputs."""
+    """Register forward pre hook to save model inputs.
 
-    def hook(_, input):
-        input_copy = deepcopy(input)
-        input_copy = tuple(i.to("cpu") for i in input_copy)
+    Diffusers pipelines often call UNet with keyword arguments such as
+    ``encoder_hidden_states`` (and ``time_ids``/``text_embeds`` for the XL
+    variant).  The previous implementation only captured positional arguments
+    and therefore missed these kwargs, resulting in incomplete calibration
+    samples.  ``with_kwargs=True`` allows the hook to access both positional
+    and keyword arguments so that all required inputs are logged.
+    """
+
+    def hook(_, args, kwargs):
+        collected = list(args)
+        for key in ["encoder_hidden_states", "time_ids", "text_embeds"]:
+            if key in kwargs:
+                collected.append(kwargs[key])
+
+        input_copy = tuple(
+            i.detach().to("cpu") if torch.is_tensor(i) else i for i in collected
+        )
         inputs.append(input_copy)
-        return input
 
-    return unet.register_forward_pre_hook(hook)
+    return unet.register_forward_pre_hook(hook, with_kwargs=True)
 
 
 def generate_calibration_data(pipe, args, calibration_dir):
