@@ -713,12 +713,30 @@ def get_timestep_embedding(
     # asserting the dimensionality we simply ensure a 1-D view.
     timesteps = timesteps.reshape(-1)
 
+    # Debug printing to help diagnose tracing issues.
+    try:
+        print(
+            f"[debug] timesteps shape: {getattr(timesteps, 'shape', 'unknown')}, "
+            f"dtype: {getattr(timesteps, 'dtype', 'unknown')}, "
+            f"type: {type(timesteps)}"
+        )
+    except Exception as e:
+        print(f"[debug] failed to print timesteps info: {e}")
+
     half_dim = embedding_dim // 2
     exponent = -math.log(max_period) * torch.arange(
         start=0, end=half_dim, dtype=torch.float32)
     exponent = exponent / (half_dim - downscale_freq_shift)
 
-    emb = torch.exp(exponent).to(device=timesteps.device)
+    # Avoid using `timesteps.device` here as it may be a Proxy during symbolic
+    # tracing, which cannot be passed as a device argument.
+    emb = torch.exp(exponent)
+    try:
+        print(
+            f"[debug] exponent device: {exponent.device}, emb device: {emb.device}" 
+        )
+    except Exception as e:
+        print(f"[debug] failed to print exponent info: {e}")
     emb = timesteps[:, None].float() * emb[None, :]
     emb = scale * emb
     emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
