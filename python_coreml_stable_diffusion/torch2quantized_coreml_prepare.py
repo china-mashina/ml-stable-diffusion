@@ -302,10 +302,15 @@ def convert_quantized_unet(pipe, args):
     else:
         unet_cls = unet_mod.UNet2DConditionModel
 
+    # Move pipeline UNet to CPU before collecting weights to avoid mixed
+    # device tensors in the reference model.
+    pipe.unet.to("cpu")
+
     reference_unet = unet_cls(
         support_controlnet=args.unet_support_controlnet, **pipe.unet.config
     ).eval()
     reference_unet.load_state_dict(pipe.unet.state_dict())
+    reference_unet.to("cpu")
 
     if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
         text_token_sequence_length = pipe.text_encoder.config.max_position_embeddings
