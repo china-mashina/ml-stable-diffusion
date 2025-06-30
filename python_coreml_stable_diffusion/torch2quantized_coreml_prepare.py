@@ -338,14 +338,9 @@ def convert_quantized_unet(pipe, args):
     config = quantize_cumulative_config(set(), set())
     logger.info("Quantizing UNet model")
 
-    # Quantization must run on CPU. After quantization, move the resulting model
-    # to the preferred runtime device (CUDA > MPS > CPU).
+    # Quantization must run on CPU. Keeping the resulting model on the same
+    # device avoids mixed-device errors when tracing.
     quant_device = "cpu"
-    run_device = (
-        "mps"
-        if torch.backends.mps.is_available()
-        else "cuda" if torch.cuda.is_available() else "cpu"
-    )
 
     reference_unet.to(quant_device)
     _log_device("Reference UNet", reference_unet)
@@ -354,7 +349,6 @@ def convert_quantized_unet(pipe, args):
     # reference_unet and calibration data are no longer needed
     del reference_unet, dataloader
     gc.collect()
-    quant_unet.to(run_device)
     _log_device("Quantized UNet", quant_unet)
 
     # Prepare sample input shapes
