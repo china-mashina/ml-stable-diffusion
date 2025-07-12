@@ -51,26 +51,8 @@ def _log_device(name, obj):
 
 torch.set_grad_enabled(False)
 
-
-CALIBRATION_DATA = [
-    "image of a transparent tall glass with ice, fruits and mint, photograph, commercial, food, warm background, beautiful image, detailed",
-    "picture of dimly lit living room, minimalist furniture, vaulted ceiling, huge room, floor to ceiling window with an ocean view, nighttime, 3D render, high quality, detailed",
-    "modern office building, 8 stories tall, glass and steel, 3D render style, wide angle view, very detailed, sharp photographic image, in an office park, bright sunny day, clear blue skies, trees and landscaping",
-    "cute small cat sitting in a movie theater eating popcorn, watching a movie, cozy indoor lighting, detailed, digital painting, character design",
-    "a highly detailed matte painting of a man on a hill watching a rocket launch in the distance by studio ghibli, volumetric lighting, octane render, 4K resolution, hyperrealism, highly detailed, insanely detailed, cinematic lighting, depth of field",
-    "an undersea world with several of fish, rocks, detailed, realistic, photograph, amazing, beautiful, high resolution",
-    "large ocean wave hitting a beach at sunset, photograph, detailed",
-    "pocket watch on a table, close up. macro, sharp, high gloss, brass, gears, sharp, detailed",
-    "pocket watch in the style of pablo picasso, painting",
-    "majestic royal tall ship on a calm sea, realistic painting, cloudy blue sky, in the style of edward hopper",
-    "german castle on a mountain, blue sky, realistic, photograph, dramatic, wide angle view",
-    "artificial intelligence, AI, concept art, blue line sketch",
-    "a humanoid robot, concept art, 3D render, high quality, detailed",
-    "donut with sprinkles and a cup of coffee on a wood table, detailed, photograph",
-    "orchard at sunset, beautiful, photograph, great composition, detailed, realistic, HDR",
-    "image of a map of a country, tattered, old, styled, illustration, for a video game style",
-    "blue and green woven fibers, nano fiber material, detailed, concept art, micro photography",
-]
+with open('prompts.txt', 'r', encoding='utf-8') as f:
+    CALIBRATION_DATA = [line.strip() for line in f.readlines()]
 
 
 def register_input_log_hook(unet, inputs):
