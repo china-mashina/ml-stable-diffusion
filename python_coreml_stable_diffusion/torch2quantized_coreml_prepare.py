@@ -51,26 +51,8 @@ def _log_device(name, obj):
 
 torch.set_grad_enabled(False)
 
-
-CALIBRATION_DATA = [
-    "image of a transparent tall glass with ice, fruits and mint, photograph, commercial, food, warm background, beautiful image, detailed",
-    "picture of dimly lit living room, minimalist furniture, vaulted ceiling, huge room, floor to ceiling window with an ocean view, nighttime, 3D render, high quality, detailed",
-    "modern office building, 8 stories tall, glass and steel, 3D render style, wide angle view, very detailed, sharp photographic image, in an office park, bright sunny day, clear blue skies, trees and landscaping",
-    "cute small cat sitting in a movie theater eating popcorn, watching a movie, cozy indoor lighting, detailed, digital painting, character design",
-    "a highly detailed matte painting of a man on a hill watching a rocket launch in the distance by studio ghibli, volumetric lighting, octane render, 4K resolution, hyperrealism, highly detailed, insanely detailed, cinematic lighting, depth of field",
-    "an undersea world with several of fish, rocks, detailed, realistic, photograph, amazing, beautiful, high resolution",
-    "large ocean wave hitting a beach at sunset, photograph, detailed",
-    "pocket watch on a table, close up. macro, sharp, high gloss, brass, gears, sharp, detailed",
-    "pocket watch in the style of pablo picasso, painting",
-    "majestic royal tall ship on a calm sea, realistic painting, cloudy blue sky, in the style of edward hopper",
-    "german castle on a mountain, blue sky, realistic, photograph, dramatic, wide angle view",
-    "artificial intelligence, AI, concept art, blue line sketch",
-    "a humanoid robot, concept art, 3D render, high quality, detailed",
-    "donut with sprinkles and a cup of coffee on a wood table, detailed, photograph",
-    "orchard at sunset, beautiful, photograph, great composition, detailed, realistic, HDR",
-    "image of a map of a country, tattered, old, styled, illustration, for a video game style",
-    "blue and green woven fibers, nano fiber material, detailed, concept art, micro photography",
-]
+with open('prompts.txt', 'r', encoding='utf-8') as f:
+    CALIBRATION_DATA = [line.strip() for line in f.readlines()]
 
 
 def register_input_log_hook(unet, inputs):
@@ -271,8 +253,9 @@ def _prepare_calibration(pipe, args, calib_dir):
     if args.generate_calibration_data or not os.path.exists(calib_dir):
         logger.info("Generating calibration data for activation quantization")
         generate_calibration_data(pipe, args, calib_dir)
-    # Quantization is only supported on CPU or CUDA. Always load calibration
-    # samples on CPU to avoid device mismatch errors during preparation.
+    # Quantization is only supported on CPU or single-device CUDA modules.
+    # Loading calibration samples on CPU avoids device mismatch errors during
+    # preparation.
     device = "cpu"
     dataloader = unet_data_loader(calib_dir, device, args.calibration_nsamples)
     if dataloader:
@@ -294,32 +277,52 @@ def convert_quantized_unet(pipe, args):
     )
     dataloader = _prepare_calibration(pipe, args, calib_dir)
 
-    # Quantize UNet weights and activations (W8A8 by default)
-    config = quantize_cumulative_config(set(), set())
-    logger.info("Quantizing UNet model")
-
+    # Create a reference UNet and gather text encoder metadata before
+    # releasing the pipeline to free memory.
     if args.xl_version:
         unet_cls = unet_mod.UNet2DConditionModelXL
     else:
         unet_cls = unet_mod.UNet2DConditionModel
 
+    # Move pipeline UNet to CPU before collecting weights to avoid mixed
+    # device tensors in the reference model.
+    pipe.unet.to("cpu")
+
     reference_unet = unet_cls(
         support_controlnet=args.unet_support_controlnet, **pipe.unet.config
     ).eval()
     reference_unet.load_state_dict(pipe.unet.state_dict())
-    # Delete original UNet to reclaim memory
+    reference_unet.to("cpu")
+
+    if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
+        text_token_sequence_length = pipe.text_encoder.config.max_position_embeddings
+        hidden_size = pipe.text_encoder.config.hidden_size
+        if hasattr(pipe, "text_encoder_2") and pipe.text_encoder_2 is not None:
+            te2_hidden_size = pipe.text_encoder_2.config.hidden_size
+            del pipe.text_encoder_2
+        else:
+            te2_hidden_size = None
+        del pipe.text_encoder
+    else:
+        text_token_sequence_length = pipe.text_encoder_2.config.max_position_embeddings
+        hidden_size = pipe.text_encoder_2.config.hidden_size
+        te2_hidden_size = pipe.text_encoder_2.config.hidden_size
+        del pipe.text_encoder_2
+
+    # Delete pipeline UNet and drop the pipeline reference to free memory before
+    # quantization. The caller should ensure there are no remaining references
+    # to the pipeline after this call.
     del pipe.unet
+    del pipe
     gc.collect()
 
-    # Quantization must run on CPU. Move the reference model and calibration
-    # data to CPU and run quantization there, then move the quantized model back
-    # to the desired runtime device afterwards.
+    # Quantize UNet weights and activations (W8A8 by default)
+    config = quantize_cumulative_config(set(), set())
+    logger.info("Quantizing UNet model")
+
+    # Quantization must run on CPU. Keeping the resulting model on the same
+    # device avoids mixed-device errors when tracing.
     quant_device = "cpu"
-    run_device = (
-        "mps"
-        if torch.backends.mps.is_available()
-        else "cuda" if torch.cuda.is_available() else "cpu"
-    )
 
     reference_unet.to(quant_device)
     _log_device("Reference UNet", reference_unet)
@@ -328,7 +331,6 @@ def convert_quantized_unet(pipe, args):
     # reference_unet and calibration data are no longer needed
     del reference_unet, dataloader
     gc.collect()
-    quant_unet.to(run_device)
     _log_device("Quantized UNet", quant_unet)
 
     # Prepare sample input shapes
@@ -340,20 +342,6 @@ def convert_quantized_unet(pipe, args):
         args.latent_w or quant_unet.config.sample_size,
     )
 
-    te2_hidden_size = None
-    if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
-        text_token_sequence_length = pipe.text_encoder.config.max_position_embeddings
-        hidden_size = pipe.text_encoder.config.hidden_size
-        if hasattr(pipe, "text_encoder_2") and pipe.text_encoder_2 is not None:
-            te2_hidden_size = pipe.text_encoder_2.config.hidden_size
-            del pipe.text_encoder_2
-        del pipe.text_encoder
-    else:
-        text_token_sequence_length = pipe.text_encoder_2.config.max_position_embeddings
-        hidden_size = pipe.text_encoder_2.config.hidden_size
-        te2_hidden_size = pipe.text_encoder_2.config.hidden_size
-        del pipe.text_encoder_2
-    gc.collect()
 
     encoder_hidden_states_shape = (
         batch_size,
@@ -452,10 +440,10 @@ def main(args):
 
     # Load diffusers pipeline as in torch2coreml
     pipe = torch2coreml.get_pipeline(args)
-    if torch.backends.mps.is_available():
-        pipe.to(device="mps", dtype=torch.float32)
-    elif torch.cuda.is_available():
+    if torch.cuda.is_available():
         pipe.to(device="cuda", dtype=torch.float32)
+    elif torch.backends.mps.is_available():
+        pipe.to(device="mps", dtype=torch.float32)
     else:
         pipe.to(device="cpu", dtype=torch.float32)
     _log_device("Pipeline", pipe)
@@ -522,7 +510,3 @@ def parser_spec():
     return parser
 
 
-if __name__ == "__main__":
-    parser = parser_spec()
-    args = parser.parse_args()
-    main(args)
