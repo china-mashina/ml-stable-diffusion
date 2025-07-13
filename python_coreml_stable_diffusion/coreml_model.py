@@ -120,6 +120,30 @@ class CoreMLModel:
         return self.model.predict(kwargs)
 
 
+class CoreMLModelPipeline:
+    """Utility for running a sequence of Core ML models.
+
+    This is used for models such as the chunked UNet where the full
+    network has been split into multiple stages. The class mimics the
+    interface of ``CoreMLModel`` so that it can be used interchangeably
+    in the pipeline code.
+    """
+
+    def __init__(self, model_paths, compute_unit, sources="packages", optimization_hints=None):
+        self.models = [CoreMLModel(p, compute_unit, sources=sources, optimization_hints=optimization_hints)
+                        for p in model_paths]
+        # Expose the expected inputs of the first stage for convenience
+        self.expected_inputs = self.models[0].expected_inputs
+
+    def __call__(self, **kwargs):
+        data = dict(kwargs)
+        for model in self.models:
+            inputs = {name: data[name] for name in model.expected_inputs}
+            outputs = model(**inputs)
+            data.update(outputs)
+        return outputs
+
+
 LOAD_TIME_INFO_MSG_TRIGGER = 10  # seconds
 
 
@@ -177,6 +201,24 @@ def _load_mlpackage(submodule_name,
             raise FileNotFoundError(
                 f"{submodule_name} CoreML model doesn't exist at {mlpackage_path}")
 
+        # Check for chunked unet
+        if submodule_name == "unet":
+            chunk1 = mlpackage_path.replace(".mlpackage", "_chunk1.mlpackage")
+            chunk2 = mlpackage_path.replace(".mlpackage", "_chunk2.mlpackage")
+            if os.path.exists(chunk1) and os.path.exists(chunk2):
+                logger.info("Loading chunked unet")
+                optimization_hints = None
+                if _macos_version() >= (15, 0):
+                    optimization_hints = {
+                        "specializationStrategy": ct.SpecializationStrategy.FastPrediction
+                    }
+                return CoreMLModelPipeline(
+                    [chunk1, chunk2],
+                    compute_unit,
+                    sources=sources,
+                    optimization_hints=optimization_hints,
+                )
+
     elif sources == 'compiled':
         logger.info(f"Loading {submodule_name} mlmodelc")
 
@@ -191,6 +233,23 @@ def _load_mlpackage(submodule_name,
         if not os.path.exists(mlpackage_path):
             raise FileNotFoundError(
                 f"{submodule_name} CoreML model doesn't exist at {mlpackage_path}")
+
+        if submodule_name == "unet":
+            chunk1 = mlpackage_path.replace(".mlmodelc", "Chunk1.mlmodelc")
+            chunk2 = mlpackage_path.replace(".mlmodelc", "Chunk2.mlmodelc")
+            if os.path.exists(chunk1) and os.path.exists(chunk2):
+                logger.info("Loading chunked unet")
+                optimization_hints = None
+                if _macos_version() >= (15, 0):
+                    optimization_hints = {
+                        "specializationStrategy": ct.SpecializationStrategy.FastPrediction
+                    }
+                return CoreMLModelPipeline(
+                    [chunk1, chunk2],
+                    compute_unit,
+                    sources=sources,
+                    optimization_hints=optimization_hints,
+                )
 
     # On macOS 15+, set fast prediction optimization hint for the unet.
     optimization_hints = None
