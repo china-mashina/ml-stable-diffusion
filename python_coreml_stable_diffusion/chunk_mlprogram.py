@@ -104,10 +104,18 @@ def _get_op_idx_split_location(prog: Program):
     main_block.operations = list(main_block.operations)
     total_size_in_mb = 0
 
+    def _const_size(op):
+        if op.op_type.startswith("const") and hasattr(op, "val"):
+            val = getattr(op.val, "val", None)
+            if isinstance(val, np.ndarray):
+                return val.size * val.itemsize
+            if isinstance(val, (bytes, bytearray)):
+                return len(val)
+        return 0
+
     for op in main_block.operations:
-        if op.op_type == "const" and isinstance(op.val.val, np.ndarray):
-            size_in_mb = op.val.val.size * op.val.val.itemsize / (1024 * 1024)
-            total_size_in_mb += size_in_mb
+        size_in_bytes = _const_size(op)
+        total_size_in_mb += size_in_bytes / (1024 * 1024)
 
     if total_size_in_mb == 0:
         # In some cases like quantized models, weight tensors may be stored in
@@ -122,9 +130,8 @@ def _get_op_idx_split_location(prog: Program):
     # the half size for the first time
     cumulative_size_in_mb = 0
     for op in main_block.operations:
-        if op.op_type == "const" and isinstance(op.val.val, np.ndarray):
-            size_in_mb = op.val.val.size * op.val.val.itemsize / (1024 * 1024)
-            cumulative_size_in_mb += size_in_mb
+        size_in_bytes = _const_size(op)
+        cumulative_size_in_mb += size_in_bytes / (1024 * 1024)
 
         # Note: The condition "not op.op_type.startswith("const")" is to make sure that the
         # incision op is neither of type "const" nor "constexpr_*" ops that
@@ -370,7 +377,30 @@ def main(args):
             merge_chunks_to_pipeline=args.merge_chunks_in_pipeline_model,
             check_output_correctness=args.check_output_correctness,
         )
-        logger.info(f"Model chunking is done.")
+
+        def _dir_size(path):
+            total = 0
+            for root_dir, _, files in os.walk(path):
+                for f in files:
+                    total += os.path.getsize(os.path.join(root_dir, f))
+            return total
+
+        name, _ = os.path.splitext(os.path.basename(args.mlpackage_path))
+        chunk1 = os.path.join(args.o, name + "_chunk1.mlpackage")
+        chunk2 = os.path.join(args.o, name + "_chunk2.mlpackage")
+        if os.path.exists(chunk1) and os.path.exists(chunk2):
+            size1 = _dir_size(chunk1)
+            size2 = _dir_size(chunk2)
+            total = size1 + size2
+            smaller = min(size1, size2)
+            if total == 0 or smaller < 0.1 * total:
+                logger.warning(
+                    "Built-in bisect_model produced highly unbalanced chunks; falling back to legacy logic."
+                )
+                shutil.rmtree(chunk1)
+                shutil.rmtree(chunk2)
+                _legacy_model_chunking(args)
+        logger.info("Model chunking is done.")
 
     # Remove original (non-chunked) model if requested
     if args.remove_original:
