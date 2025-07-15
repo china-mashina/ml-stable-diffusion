@@ -108,6 +108,14 @@ def _get_op_idx_split_location(prog: Program):
         if op.op_type == "const" and isinstance(op.val.val, np.ndarray):
             size_in_mb = op.val.val.size * op.val.val.itemsize / (1024 * 1024)
             total_size_in_mb += size_in_mb
+
+    if total_size_in_mb == 0:
+        # In some cases like quantized models, weight tensors may be stored in
+        # compressed ops which are not detected above. Falling back to simply
+        # splitting the graph in the middle by operation count avoids creating
+        # an empty first chunk.
+        op_idx = len(main_block.operations) // 2
+        return op_idx, 0, 0
     half_size = total_size_in_mb / 2
 
     # Find the first non const op (single child), where the total cumulative size exceeds
