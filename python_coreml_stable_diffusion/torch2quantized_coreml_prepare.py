@@ -26,6 +26,7 @@ from coremltools.optimize.torch.quantization import (
 from python_coreml_stable_diffusion import (
     torch2coreml,
     unet as unet_mod,
+    chunk_mlprogram,
 )
 from python_coreml_stable_diffusion.layer_norm import LayerNormANE
 from python_coreml_stable_diffusion.unet import Einsum
@@ -267,172 +268,197 @@ def _prepare_calibration(pipe, args, calib_dir):
 def convert_quantized_unet(pipe, args):
     """Quantize `pipe.unet` and convert it to Core ML."""
     out_path = torch2coreml._get_out_path(args, "unet")
-    if os.path.exists(out_path):
-        logger.info(f"`unet` already exists at {out_path}, skipping conversion.")
+
+    # Check if Unet chunks already exist
+    unet_chunks_exist = all(
+        os.path.exists(out_path.replace(".mlpackage", f"_chunk{idx+1}.mlpackage"))
+        for idx in range(2)
+    )
+
+    if args.chunk_unet and unet_chunks_exist:
+        logger.info("`unet` chunks already exist, skipping conversion.")
+        del pipe.unet
+        gc.collect()
         return
 
-    # Calibration data
-    calib_dir = os.path.join(
-        args.o, f"calibration_data_{args.model_version.replace('/', '_')}"
-    )
-    dataloader = _prepare_calibration(pipe, args, calib_dir)
+    convert_model = not os.path.exists(out_path)
+    if not convert_model:
+        logger.info(f"`unet` already exists at {out_path}, skipping conversion.")
+    
+    if convert_model:
+        # Calibration data
+        calib_dir = os.path.join(
+            args.o, f"calibration_data_{args.model_version.replace('/', '_')}"
+        )
+        dataloader = _prepare_calibration(pipe, args, calib_dir)
 
-    # Create a reference UNet and gather text encoder metadata before
-    # releasing the pipeline to free memory.
-    if args.xl_version:
-        unet_cls = unet_mod.UNet2DConditionModelXL
-    else:
-        unet_cls = unet_mod.UNet2DConditionModel
+        # Create a reference UNet and gather text encoder metadata before
+        # releasing the pipeline to free memory.
+        if args.xl_version:
+            unet_cls = unet_mod.UNet2DConditionModelXL
+        else:
+            unet_cls = unet_mod.UNet2DConditionModel
 
-    # Move pipeline UNet to CPU before collecting weights to avoid mixed
-    # device tensors in the reference model.
-    pipe.unet.to("cpu")
+        # Move pipeline UNet to CPU before collecting weights to avoid mixed
+        # device tensors in the reference model.
+        pipe.unet.to("cpu")
 
-    reference_unet = unet_cls(
-        support_controlnet=args.unet_support_controlnet, **pipe.unet.config
-    ).eval()
-    reference_unet.load_state_dict(pipe.unet.state_dict())
-    reference_unet.to("cpu")
+        reference_unet = unet_cls(
+            support_controlnet=args.unet_support_controlnet, **pipe.unet.config
+        ).eval()
+        reference_unet.load_state_dict(pipe.unet.state_dict())
+        reference_unet.to("cpu")
 
-    if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
-        text_token_sequence_length = pipe.text_encoder.config.max_position_embeddings
-        hidden_size = pipe.text_encoder.config.hidden_size
-        if hasattr(pipe, "text_encoder_2") and pipe.text_encoder_2 is not None:
+        if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
+            text_token_sequence_length = pipe.text_encoder.config.max_position_embeddings
+            hidden_size = pipe.text_encoder.config.hidden_size
+            if hasattr(pipe, "text_encoder_2") and pipe.text_encoder_2 is not None:
+                te2_hidden_size = pipe.text_encoder_2.config.hidden_size
+                del pipe.text_encoder_2
+            else:
+                te2_hidden_size = None
+            del pipe.text_encoder
+        else:
+            text_token_sequence_length = pipe.text_encoder_2.config.max_position_embeddings
+            hidden_size = pipe.text_encoder_2.config.hidden_size
             te2_hidden_size = pipe.text_encoder_2.config.hidden_size
             del pipe.text_encoder_2
-        else:
-            te2_hidden_size = None
-        del pipe.text_encoder
-    else:
-        text_token_sequence_length = pipe.text_encoder_2.config.max_position_embeddings
-        hidden_size = pipe.text_encoder_2.config.hidden_size
-        te2_hidden_size = pipe.text_encoder_2.config.hidden_size
-        del pipe.text_encoder_2
 
     # Delete pipeline UNet and drop the pipeline reference to free memory before
     # quantization. The caller should ensure there are no remaining references
     # to the pipeline after this call.
-    del pipe.unet
-    del pipe
-    gc.collect()
+        del pipe.unet
+        del pipe
+        gc.collect()
 
     # Quantize UNet weights and activations (W8A8 by default)
-    config = quantize_cumulative_config(set(), set())
-    logger.info("Quantizing UNet model")
+        config = quantize_cumulative_config(set(), set())
+        logger.info("Quantizing UNet model")
 
     # Quantization must run on CPU. Keeping the resulting model on the same
     # device avoids mixed-device errors when tracing.
-    quant_device = "cpu"
+        quant_device = "cpu"
 
-    reference_unet.to(quant_device)
-    _log_device("Reference UNet", reference_unet)
+        reference_unet.to(quant_device)
+        _log_device("Reference UNet", reference_unet)
 
-    quant_unet = quantize(reference_unet, config, dataloader)
-    # reference_unet and calibration data are no longer needed
-    del reference_unet, dataloader
-    gc.collect()
-    _log_device("Quantized UNet", quant_unet)
+        quant_unet = quantize(reference_unet, config, dataloader)
+        # reference_unet and calibration data are no longer needed
+        del reference_unet, dataloader
+        gc.collect()
+        _log_device("Quantized UNet", quant_unet)
 
     # Prepare sample input shapes
-    batch_size = 1 if args.unet_batch_one else 2
-    sample_shape = (
-        batch_size,
-        quant_unet.config.in_channels,
-        args.latent_h or quant_unet.config.sample_size,
-        args.latent_w or quant_unet.config.sample_size,
-    )
-
-
-    encoder_hidden_states_shape = (
-        batch_size,
-        args.text_encoder_hidden_size
-        or quant_unet.config.cross_attention_dim
-        or hidden_size,
-        1,
-        args.text_token_sequence_length or text_token_sequence_length,
-    )
-
-    sample_inputs = OrderedDict(
-        [
-            ("sample", torch.rand(*sample_shape, dtype=torch.float32)),
-            ("timestep", torch.tensor([0] * batch_size).to(torch.float32)),
-            (
-                "encoder_hidden_states",
-                torch.rand(*encoder_hidden_states_shape, dtype=torch.float32),
-            ),
-        ]
-    )
-
-    if args.xl_version:
-        height = (args.latent_h or quant_unet.config.sample_size) * 8
-        width = (args.latent_w or quant_unet.config.sample_size) * 8
-        original_size = (height, width)
-        crops_coords_top_left = (0, 0)
-        target_size = (height, width)
-        add_time_ids = list(original_size + crops_coords_top_left + target_size)
-        add_neg_time_ids = list(original_size + crops_coords_top_left + target_size)
-        time_ids = [add_neg_time_ids, add_time_ids]
-        text_embeds_shape = (
+        batch_size = 1 if args.unet_batch_one else 2
+        sample_shape = (
             batch_size,
-            te2_hidden_size,
+            quant_unet.config.in_channels,
+            args.latent_h or quant_unet.config.sample_size,
+            args.latent_w or quant_unet.config.sample_size,
         )
-        additional = OrderedDict(
+
+
+        encoder_hidden_states_shape = (
+            batch_size,
+            args.text_encoder_hidden_size
+            or quant_unet.config.cross_attention_dim
+            or hidden_size,
+            1,
+            args.text_token_sequence_length or text_token_sequence_length,
+        )
+
+        sample_inputs = OrderedDict(
             [
-                ("time_ids", torch.tensor(time_ids).to(torch.float32)),
+                ("sample", torch.rand(*sample_shape, dtype=torch.float32)),
+                ("timestep", torch.tensor([0] * batch_size).to(torch.float32)),
                 (
-                    "text_embeds",
-                    torch.rand(*text_embeds_shape, dtype=torch.float32),
+                    "encoder_hidden_states",
+                    torch.rand(*encoder_hidden_states_shape, dtype=torch.float32),
                 ),
             ]
         )
-        sample_inputs.update(additional)
+
+        if args.xl_version:
+            height = (args.latent_h or quant_unet.config.sample_size) * 8
+            width = (args.latent_w or quant_unet.config.sample_size) * 8
+            original_size = (height, width)
+            crops_coords_top_left = (0, 0)
+            target_size = (height, width)
+            add_time_ids = list(original_size + crops_coords_top_left + target_size)
+            add_neg_time_ids = list(original_size + crops_coords_top_left + target_size)
+            time_ids = [add_neg_time_ids, add_time_ids]
+            text_embeds_shape = (
+                batch_size,
+                te2_hidden_size,
+            )
+            additional = OrderedDict(
+                [
+                    ("time_ids", torch.tensor(time_ids).to(torch.float32)),
+                    (
+                        "text_embeds",
+                        torch.rand(*text_embeds_shape, dtype=torch.float32),
+                    ),
+                ]
+            )
+            sample_inputs.update(additional)
 
     # Ensure sample inputs are on the same device as the model
-    for k, v in sample_inputs.items():
-        sample_inputs[k] = v.to(quant_unet.device)
-        _log_device(f"Sample input {k}", sample_inputs[k])
+        for k, v in sample_inputs.items():
+            sample_inputs[k] = v.to(quant_unet.device)
+            _log_device(f"Sample input {k}", sample_inputs[k])
 
-    sample_inputs_spec = {k: (v.shape, v.dtype) for k, v in sample_inputs.items()}
-    logger.info(f"Sample UNet inputs spec: {sample_inputs_spec}")
+        sample_inputs_spec = {k: (v.shape, v.dtype) for k, v in sample_inputs.items()}
+        logger.info(f"Sample UNet inputs spec: {sample_inputs_spec}")
 
-    logger.info("JIT tracing quantized UNet")
-    traced_unet = torch.jit.trace(quant_unet, list(sample_inputs.values()))
-    _log_device("Traced UNet", traced_unet)
+        logger.info("JIT tracing quantized UNet")
+        traced_unet = torch.jit.trace(quant_unet, list(sample_inputs.values()))
+        _log_device("Traced UNet", traced_unet)
 
-    coreml_inputs = {k: v.numpy().astype(np.float32) for k, v in sample_inputs.items()}
-    coreml_unet, out_path = torch2coreml._convert_to_coreml(
-        "unet",
-        traced_unet,
-        coreml_inputs,
-        ["noise_pred"],
-        args,
-        precision=ct.precision.FLOAT32,
-    )
-
-    coreml_unet.author = f"Please refer to the Model Card available at huggingface.co/{args.model_version}"
-    if args.xl_version:
-        coreml_unet.license = "OpenRAIL++-M (https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/blob/main/LICENSE.md)"
-    else:
-        coreml_unet.license = (
-            "OpenRAIL (https://huggingface.co/spaces/CompVis/stable-diffusion-license)"
+        coreml_inputs = {k: v.numpy().astype(np.float32) for k, v in sample_inputs.items()}
+        coreml_unet, out_path = torch2coreml._convert_to_coreml(
+            "unet",
+            traced_unet,
+            coreml_inputs,
+            ["noise_pred"],
+            args,
+            precision=ct.precision.FLOAT32,
         )
-    coreml_unet.version = args.model_version
-    coreml_unet.short_description = (
-        "Stable Diffusion generates images conditioned on text or other images as input through the diffusion process. "
-        "Please refer to https://arxiv.org/abs/2112.10752 for details."
-    )
 
-    from python_coreml_stable_diffusion._version import __version__
+        coreml_unet.author = f"Please refer to the Model Card available at huggingface.co/{args.model_version}"
+        if args.xl_version:
+            coreml_unet.license = "OpenRAIL++-M (https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/blob/main/LICENSE.md)"
+        else:
+            coreml_unet.license = (
+                "OpenRAIL (https://huggingface.co/spaces/CompVis/stable-diffusion-license)"
+            )
+        coreml_unet.version = args.model_version
+        coreml_unet.short_description = (
+            "Stable Diffusion generates images conditioned on text or other images as input through the diffusion process. "
+            "Please refer to https://arxiv.org/abs/2112.10752 for details."
+        )
 
-    coreml_unet.user_defined_metadata[
-        "com.github.apple.ml-stable-diffusion.version"
-    ] = __version__
+        from python_coreml_stable_diffusion._version import __version__
 
-    coreml_unet.save(out_path)
-    logger.info(f"Saved quantized unet into {out_path}")
+        coreml_unet.user_defined_metadata[
+            "com.github.apple.ml-stable-diffusion.version"
+        ] = __version__
 
-    del quant_unet, traced_unet, coreml_unet
-    gc.collect()
+        coreml_unet.save(out_path)
+        logger.info(f"Saved quantized unet into {out_path}")
+
+        del quant_unet, traced_unet, coreml_unet
+        gc.collect()
+    else:
+        del pipe.unet
+        gc.collect()
+        logger.info(f"`unet` already exists at {out_path}, skipping conversion.")
+
+    if args.chunk_unet and not unet_chunks_exist:
+        logger.info("Chunking unet in two approximately equal MLModels")
+        args.mlpackage_path = out_path
+        args.remove_original = False
+        args.merge_chunks_in_pipeline_model = False
+        chunk_mlprogram.main(args)
 
 
 def main(args):
