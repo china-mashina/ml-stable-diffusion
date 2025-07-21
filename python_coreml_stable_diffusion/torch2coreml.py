@@ -97,7 +97,7 @@ def report_correctness(original_outputs, final_outputs, log_prefix):
     return final_psnr
 
 def _get_out_path(args, submodule_name):
-    fname = f"Stable_Diffusion_version_{args.model_version}_{submodule_name}.mlpackage"
+    fname = f"Stable_Diffusion_{submodule_name}.mlpackage"
     fname = fname.replace("/", "_")
     return os.path.join(args.o, fname)
 

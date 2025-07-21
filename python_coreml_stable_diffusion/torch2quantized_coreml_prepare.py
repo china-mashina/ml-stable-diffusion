@@ -273,7 +273,7 @@ def convert_quantized_unet(pipe, args):
 
     # Calibration data
     calib_dir = os.path.join(
-        args.o, f"calibration_data_{args.model_version.replace('/', '_')}"
+        args.o, f"calibration_data"
     )
     dataloader = _prepare_calibration(pipe, args, calib_dir)
 
