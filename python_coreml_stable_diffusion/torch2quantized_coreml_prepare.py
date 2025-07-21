@@ -431,6 +431,12 @@ def convert_quantized_unet(pipe, args):
     coreml_unet.save(out_path)
     logger.info(f"Saved quantized unet into {out_path}")
 
+    if args.bundle_resources_for_swift_cli:
+        resources_dir = os.path.join(args.o, "Resources")
+        os.makedirs(resources_dir, exist_ok=True)
+        target_path = torch2coreml._compile_coreml_model(out_path, resources_dir, "Unet")
+        logger.info(f"Compiled {out_path} to {target_path}")
+
     del quant_unet, traced_unet, coreml_unet
     gc.collect()
 
@@ -508,5 +514,11 @@ def parser_spec():
         help="Run calibration data generation on a single prompt",
     )
     return parser
+
+
+if __name__ == "__main__":
+    parser = parser_spec()
+    args = parser.parse_args()
+    main(args)
 
 
