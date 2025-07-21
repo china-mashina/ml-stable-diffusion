@@ -26,6 +26,7 @@ from coremltools.optimize.torch.quantization import (
 from python_coreml_stable_diffusion import (
     torch2coreml,
     unet as unet_mod,
+    chunk_mlprogram,
 )
 from python_coreml_stable_diffusion.layer_norm import LayerNormANE
 from python_coreml_stable_diffusion.unet import Einsum
@@ -267,6 +268,16 @@ def _prepare_calibration(pipe, args, calib_dir):
 def convert_quantized_unet(pipe, args):
     """Quantize `pipe.unet` and convert it to Core ML."""
     out_path = torch2coreml._get_out_path(args, "unet")
+    unet_chunks_exist = all(
+        os.path.exists(out_path.replace(".mlpackage", f"_chunk{idx+1}.mlpackage"))
+        for idx in range(2)
+    )
+
+    if args.chunk_unet and unet_chunks_exist:
+        logger.info("`unet` chunks already exist, skipping conversion.")
+        del pipe.unet
+        gc.collect()
+        return
     if os.path.exists(out_path):
         logger.info(f"`unet` already exists at {out_path}, skipping conversion.")
         return
@@ -433,6 +444,13 @@ def convert_quantized_unet(pipe, args):
 
     del quant_unet, traced_unet, coreml_unet
     gc.collect()
+
+    if args.chunk_unet and not unet_chunks_exist:
+        logger.info("Chunking unet in two approximately equal MLModels")
+        args.mlpackage_path = out_path
+        args.remove_original = False
+        args.merge_chunks_in_pipeline_model = False
+        chunk_mlprogram.main(args)
 
 
 def main(args):
