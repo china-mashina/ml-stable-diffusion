@@ -98,29 +98,51 @@ def _load_prog_from_mlmodel(model):
 
 
 def _get_op_idx_split_location(prog: Program):
-    """ Find the op that approximately bisects the graph as measure by weights size on each side
+    """Find the op that approximately bisects the graph by weight size.
+
+    Quantized models often encode parameters via ``constexpr_*`` operations
+    rather than plain ``const`` ops.  The original implementation ignored these
+    ops which caused the computed split location to be heavily skewed towards
+    the beginning of the graph.  This function accounts for both storage
+    mechanisms by attributing the weight size to ``constexpr_*`` outputs and
+    skipping ``const`` ops that only feed such operators.
     """
+
     main_block = prog.functions["main"]
     main_block.operations = list(main_block.operations)
-    total_size_in_mb = 0
 
-    for op in main_block.operations:
+    def _tensor_size_in_mb(var: Var) -> float:
+        if var.val is not None and isinstance(var.val.val, np.ndarray):
+            arr = var.val.val
+            return arr.size * arr.itemsize / (1024 * 1024)
+        if (var.shape is not None and var.dtype is not None
+                and all(dim is not None for dim in var.shape)):
+            np_dtype = types.nptype_from_builtin(var.dtype)
+            return (np.prod(var.shape) * np.dtype(np_dtype).itemsize) / (1024 * 1024)
+        return 0.0
+
+    def _op_weight_size_in_mb(op) -> float:
         if op.op_type == "const" and isinstance(op.val.val, np.ndarray):
-            size_in_mb = op.val.val.size * op.val.val.itemsize / (1024 * 1024)
-            total_size_in_mb += size_in_mb
+            # If this const exclusively feeds a constexpr op, account for the
+            # weight when processing that op instead to avoid double counting.
+            if (len(op.outputs) == 1 and len(op.outputs[0].child_ops) == 1
+                    and op.outputs[0].child_ops[0].op_type.startswith("constexpr_")):
+                return 0.0
+            return _tensor_size_in_mb(op.outputs[0])
+
+        if op.op_type.startswith("constexpr_") and len(op.outputs) == 1:
+            return _tensor_size_in_mb(op.outputs[0])
+
+        return 0.0
+
+    total_size_in_mb = sum(_op_weight_size_in_mb(op) for op in main_block.operations)
     half_size = total_size_in_mb / 2
 
-    # Find the first non const op (single child), where the total cumulative size exceeds
-    # the half size for the first time
-    cumulative_size_in_mb = 0
+    cumulative_size_in_mb = 0.0
     for op in main_block.operations:
-        if op.op_type == "const" and isinstance(op.val.val, np.ndarray):
-            size_in_mb = op.val.val.size * op.val.val.itemsize / (1024 * 1024)
-            cumulative_size_in_mb += size_in_mb
+        cumulative_size_in_mb += _op_weight_size_in_mb(op)
 
-        # Note: The condition "not op.op_type.startswith("const")" is to make sure that the
-        # incision op is neither of type "const" nor "constexpr_*" ops that
-        # are used to store compressed weights
+        # Select a non-const op (single child) once the cumulative size exceeds half
         if (cumulative_size_in_mb > half_size and not op.op_type.startswith("const")
                 and len(op.outputs) == 1
                 and len(op.outputs[0].child_ops) == 1):
