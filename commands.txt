@@ -2,3 +2,5 @@ python -m python_coreml_stable_diffusion.sdxl2coreml
 
 with open('prompts.txt', 'r', encoding='utf-8') as f:
   CALIBRATION_DATA = [line.strip() for line in f.readlines()]
+  
+python -m python_coreml_stable_diffusion.torch2coreml --convert-vae-decoder --convert-text-encoder --xl-version --model-version model --attention-implementation SPLIT_EINSUM -o output

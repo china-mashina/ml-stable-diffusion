@@ -16,7 +16,6 @@ DEFAULT_ARGS = [
     "--xl-version",
     "--model-version",
     "model",
-    "--bundle-resources-for-swift-cli",
     "--attention-implementation",
     "SPLIT_EINSUM",
     "-o",
