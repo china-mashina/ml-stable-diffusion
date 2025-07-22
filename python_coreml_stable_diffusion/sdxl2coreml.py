@@ -27,6 +27,7 @@ DEFAULT_ARGS = [
     "96",
     "--latent-w",
     "96",
+    "--chunk-unet"
 ]
 
 

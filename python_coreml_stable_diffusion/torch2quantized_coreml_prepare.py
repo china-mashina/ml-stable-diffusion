@@ -268,16 +268,7 @@ def _prepare_calibration(pipe, args, calib_dir):
 def convert_quantized_unet(pipe, args):
     """Quantize `pipe.unet` and convert it to Core ML."""
     out_path = torch2coreml._get_out_path(args, "unet")
-    unet_chunks_exist = all(
-        os.path.exists(out_path.replace(".mlpackage", f"_chunk{idx+1}.mlpackage"))
-        for idx in range(2)
-    )
 
-    if args.chunk_unet and unet_chunks_exist:
-        logger.info("`unet` chunks already exist, skipping conversion.")
-        del pipe.unet
-        gc.collect()
-        return
     if os.path.exists(out_path):
         logger.info(f"`unet` already exists at {out_path}, skipping conversion.")
         return
@@ -445,14 +436,19 @@ def convert_quantized_unet(pipe, args):
     del quant_unet, traced_unet, coreml_unet
     gc.collect()
 
-    if args.chunk_unet and not unet_chunks_exist:
+def chunk_unet(args):
+    out_path = torch2coreml._get_out_path(args, "unet")
+    unet_chunks_exist = all(
+        os.path.exists(out_path.replace(".mlpackage", f"_chunk{idx+1}.mlpackage"))
+        for idx in range(2)
+    )
+    if not unet_chunks_exist:
         logger.info("Chunking unet in two approximately equal MLModels")
         args.mlpackage_path = out_path
         args.remove_original = False
         args.merge_chunks_in_pipeline_model = False
         chunk_mlprogram.main(args)
-
-
+        
 def main(args):
     os.makedirs(args.o, exist_ok=True)
 
@@ -476,32 +472,15 @@ def main(args):
     unet_mod.ATTENTION_IMPLEMENTATION_IN_EFFECT = unet_mod.AttentionImplementations[
         args.attention_implementation
     ]
-
-    if args.convert_vae_decoder:
-        torch2coreml.convert_vae_decoder(pipe, args)
-    if args.convert_vae_encoder:
-        torch2coreml.convert_vae_encoder(pipe, args)
-    if args.convert_text_encoder and hasattr(pipe, "text_encoder"):
-        torch2coreml.convert_text_encoder(
-            pipe.text_encoder, pipe.tokenizer, "text_encoder", args
-        )
-    if args.convert_text_encoder and hasattr(pipe, "text_encoder_2"):
-        torch2coreml.convert_text_encoder(
-            pipe.text_encoder_2, pipe.tokenizer_2, "text_encoder_2", args
-        )
-    if args.convert_safety_checker:
-        torch2coreml.convert_safety_checker(pipe, args)
-
+    
     if args.convert_unet:
         convert_quantized_unet(pipe, args)
         del pipe
         gc.collect()
-
-    if args.quantize_nbits is not None:
-        torch2coreml.quantize_weights(args)
-
-    if args.bundle_resources_for_swift_cli:
-        torch2coreml.bundle_resources_for_swift_cli(args)
+    
+    print("chunk unet shynggys")
+    if args.chunk_unet:
+        chunk_unet(args)
 
 
 def parser_spec():

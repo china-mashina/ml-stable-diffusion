@@ -366,27 +366,14 @@ def _legacy_model_chunking(args):
 def main(args):
     ct_version = ct.__version__
 
-    if ct_version != "8.0b2" and ct_version < "8.0":
-        # With coremltools version <= 8.0b1,
-        # we use the legacy implementation.
-        # TODO: Remove the logic after setting the coremltools dependency >= 8.0.
-        logger.info(
-            f"coremltools version {ct_version} detected. Recommended upgrading the package version to "
-            f"'8.0b2' when you running chunk_mlprogram.py script for the latest supports and bug fixes."
-        )
-        _legacy_model_chunking(args)
-    else:
-        # Starting from coremltools==8.0b2, there is this `bisect_model` API that
-        # we can directly call into.
-        from coremltools.models.utils import bisect_model
-        logger.info(f"Start chunking model {args.mlpackage_path} into two pieces.")
-        ct.models.utils.bisect_model(
-            model=args.mlpackage_path,
-            output_dir=args.o,
-            merge_chunks_to_pipeline=args.merge_chunks_in_pipeline_model,
-            check_output_correctness=args.check_output_correctness,
-        )
-        logger.info(f"Model chunking is done.")
+    # With coremltools version <= 8.0b1,
+    # we use the legacy implementation.
+    # TODO: Remove the logic after setting the coremltools dependency >= 8.0.
+    logger.info(
+        f"coremltools version {ct_version} detected. Recommended upgrading the package version to "
+        f"'8.0b2' when you running chunk_mlprogram.py script for the latest supports and bug fixes."
+    )
+    _legacy_model_chunking(args)
 
     # Remove original (non-chunked) model if requested
     if args.remove_original:
