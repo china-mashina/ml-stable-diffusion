@@ -98,29 +98,91 @@ def _load_prog_from_mlmodel(model):
 
 
 def _get_op_idx_split_location(prog: Program):
-    """ Find the op that approximately bisects the graph as measure by weights size on each side
+    """Find the op that approximately bisects the graph by weight size.
+
+    Quantized models often encode parameters via ``constexpr_*`` operations
+    rather than plain ``const`` ops.  The original implementation ignored these
+    ops which caused the computed split location to be heavily skewed towards
+    the beginning of the graph.  This function accounts for both storage
+    mechanisms by attributing the weight size to ``constexpr_*`` outputs and
+    skipping ``const`` ops that only feed such operators.
     """
+
     main_block = prog.functions["main"]
     main_block.operations = list(main_block.operations)
-    total_size_in_mb = 0
 
-    for op in main_block.operations:
-        if op.op_type == "const" and isinstance(op.val.val, np.ndarray):
-            size_in_mb = op.val.val.size * op.val.val.itemsize / (1024 * 1024)
-            total_size_in_mb += size_in_mb
+    def _tensor_size_in_mb(var: Var) -> float:
+        """Return the memory footprint of ``var`` in megabytes."""
+
+        # Depending on how the tensor was created, ``var.val`` could either be a
+        # ``numpy.ndarray`` directly or a wrapper object with a ``val`` attribute
+        # pointing to the array.  Older implementations assumed the latter which
+        # causes an ``AttributeError`` when ``var.val`` is already an ndarray.
+        val = var.val
+        if isinstance(val, np.ndarray):
+            arr = val
+        elif val is not None and hasattr(val, "val") and isinstance(val.val, np.ndarray):
+            arr = val.val
+        else:
+            arr = None
+
+        if arr is not None:
+            return arr.size * arr.itemsize / (1024 * 1024)
+
+        if (
+            var.shape is not None
+            and var.dtype is not None
+            and all(dim is not None for dim in var.shape)
+        ):
+            np_dtype = types.nptype_from_builtin(var.dtype)
+            return (np.prod(var.shape) * np.dtype(np_dtype).itemsize) / (1024 * 1024)
+
+        return 0.0
+
+    accounted_ops = set()
+
+    def _collect_const_size(var: Var) -> float:
+        """Return the size of a constant ancestor and mark it as accounted."""
+        if not isinstance(var, Var) or var.op is None:
+            return 0.0
+
+        producer = var.op
+        if producer in accounted_ops:
+            return 0.0
+
+        if producer.op_type == "const" or producer.op_type.startswith("constexpr_"):
+            accounted_ops.add(producer)
+            return _tensor_size_in_mb(producer.outputs[0])
+
+        if producer.op_type in {"quantize", "dequantize"}:
+            inp = list(producer.inputs.values())[0]
+            if isinstance(inp, (list, tuple)):
+                inp = inp[0]
+            return _collect_const_size(inp)
+
+        return 0.0
+
+    def _op_weight_size_in_mb(op) -> float:
+        size = 0.0
+        for inp in op.inputs.values():
+            if isinstance(inp, (list, tuple)):
+                for v in inp:
+                    size += _collect_const_size(v)
+            else:
+                size += _collect_const_size(inp)
+        return size
+
+    op_sizes = [
+        _op_weight_size_in_mb(op) for op in main_block.operations
+    ]
+    total_size_in_mb = sum(op_sizes)
     half_size = total_size_in_mb / 2
 
-    # Find the first non const op (single child), where the total cumulative size exceeds
-    # the half size for the first time
-    cumulative_size_in_mb = 0
-    for op in main_block.operations:
-        if op.op_type == "const" and isinstance(op.val.val, np.ndarray):
-            size_in_mb = op.val.val.size * op.val.val.itemsize / (1024 * 1024)
-            cumulative_size_in_mb += size_in_mb
+    cumulative_size_in_mb = 0.0
+    for op, size in zip(main_block.operations, op_sizes):
+        cumulative_size_in_mb += size
 
-        # Note: The condition "not op.op_type.startswith("const")" is to make sure that the
-        # incision op is neither of type "const" nor "constexpr_*" ops that
-        # are used to store compressed weights
+        # Select a non-const op (single child) once the cumulative size exceeds half
         if (cumulative_size_in_mb > half_size and not op.op_type.startswith("const")
                 and len(op.outputs) == 1
                 and len(op.outputs[0].child_ops) == 1):
@@ -177,7 +239,7 @@ def _make_second_chunk_prog(prog, op_idx):
     """ Build second chunk by rebuilding a pristine MIL Program from MLModel
     """
     block = prog.functions["main"]
-    block.opset_version = ct.target.iOS16
+    block.opset_version = ct.target.iOS17
 
     # First chunk outputs are second chunk inputs (e.g. skip connections)
     boundary_vars = _get_first_chunk_outputs(block, op_idx)
@@ -286,7 +348,7 @@ def _legacy_model_chunking(args):
         prog_chunk1,
         convert_to="mlprogram",
         compute_units=ct.ComputeUnit.CPU_ONLY,
-        minimum_deployment_target=ct.target.iOS16,
+        minimum_deployment_target=ct.target.iOS17,
     )
     del prog_chunk1
     gc.collect()
@@ -296,7 +358,7 @@ def _legacy_model_chunking(args):
         prog_chunk2,
         convert_to="mlprogram",
         compute_units=ct.ComputeUnit.CPU_ONLY,
-        minimum_deployment_target=ct.target.iOS16,
+        minimum_deployment_target=ct.target.iOS17,
     )
     del prog_chunk2
     gc.collect()
