@@ -26,6 +26,7 @@ logger.setLevel(logging.INFO)
 
 import numpy as np
 import os
+import zlib
 from python_coreml_stable_diffusion import torch2coreml
 import shutil
 import time
@@ -98,14 +99,16 @@ def _load_prog_from_mlmodel(model):
 
 
 def _get_op_idx_split_location(prog: Program):
-    """Find the op that approximately bisects the graph by weight size.
+    """Find the op that approximately bisects the graph by compressed weight size.
 
     Quantized models often encode parameters via ``constexpr_*`` operations
     rather than plain ``const`` ops.  The original implementation ignored these
     ops which caused the computed split location to be heavily skewed towards
     the beginning of the graph.  This function accounts for both storage
     mechanisms by attributing the weight size to ``constexpr_*`` outputs and
-    skipping ``const`` ops that only feed such operators.
+    skipping ``const`` ops that only feed such operators.  The size estimates
+    use zlib to roughly model how the weights will compress inside the final
+    ``.mlpackage`` files.
     """
 
     main_block = prog.functions["main"]
@@ -139,6 +142,25 @@ def _get_op_idx_split_location(prog: Program):
 
         return 0.0
 
+    def _tensor_compressed_size_in_mb(var: Var) -> float:
+        """Approximate the compressed size of ``var`` in megabytes."""
+        val = var.val
+        if isinstance(val, np.ndarray):
+            arr = val
+        elif val is not None and hasattr(val, "val") and isinstance(val.val, np.ndarray):
+            arr = val.val
+        else:
+            arr = None
+
+        if arr is not None:
+            try:
+                compressed = zlib.compress(arr.tobytes())
+                return len(compressed) / (1024 * 1024)
+            except Exception:
+                return arr.size * arr.itemsize / (1024 * 1024)
+
+        return _tensor_size_in_mb(var)
+
     accounted_ops = set()
 
     def _collect_const_size(var: Var) -> float:
@@ -152,7 +174,7 @@ def _get_op_idx_split_location(prog: Program):
 
         if producer.op_type == "const" or producer.op_type.startswith("constexpr_"):
             accounted_ops.add(producer)
-            return _tensor_size_in_mb(producer.outputs[0])
+            return _tensor_compressed_size_in_mb(producer.outputs[0])
 
         if producer.op_type in {"quantize", "dequantize"}:
             inp = list(producer.inputs.values())[0]
@@ -162,7 +184,7 @@ def _get_op_idx_split_location(prog: Program):
 
         return 0.0
 
-    def _op_weight_size_in_mb(op) -> float:
+    def _op_weight_compressed_size_in_mb(op) -> float:
         size = 0.0
         for inp in op.inputs.values():
             if isinstance(inp, (list, tuple)):
@@ -173,7 +195,7 @@ def _get_op_idx_split_location(prog: Program):
         return size
 
     op_sizes = [
-        _op_weight_size_in_mb(op) for op in main_block.operations
+        _op_weight_compressed_size_in_mb(op) for op in main_block.operations
     ]
     total_size_in_mb = sum(op_sizes)
     half_size = total_size_in_mb / 2
