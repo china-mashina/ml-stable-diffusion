@@ -139,33 +139,48 @@ def _get_op_idx_split_location(prog: Program):
 
         return 0.0
 
-    def _op_weight_size_in_mb(op) -> float:
-        if op.op_type == "const":
-            val = op.val
-            arr = val.val if hasattr(val, "val") else val
-            if isinstance(arr, np.ndarray):
-                # If this const exclusively feeds a ``constexpr_*`` op, account
-                # for the weight when processing that op instead to avoid
-                # double counting.
-                if (
-                    len(op.outputs) == 1
-                    and len(op.outputs[0].child_ops) == 1
-                    and op.outputs[0].child_ops[0].op_type.startswith("constexpr_")
-                ):
-                    return 0.0
-                return _tensor_size_in_mb(op.outputs[0])
+    accounted_ops = set()
 
-        if op.op_type.startswith("constexpr_") and len(op.outputs) == 1:
-            return _tensor_size_in_mb(op.outputs[0])
+    def _collect_const_size(var: Var) -> float:
+        """Return the size of a constant ancestor and mark it as accounted."""
+        if not isinstance(var, Var) or var.op is None:
+            return 0.0
+
+        producer = var.op
+        if producer in accounted_ops:
+            return 0.0
+
+        if producer.op_type == "const" or producer.op_type.startswith("constexpr_"):
+            accounted_ops.add(producer)
+            return _tensor_size_in_mb(producer.outputs[0])
+
+        if producer.op_type in {"quantize", "dequantize"}:
+            inp = list(producer.inputs.values())[0]
+            if isinstance(inp, (list, tuple)):
+                inp = inp[0]
+            return _collect_const_size(inp)
 
         return 0.0
 
-    total_size_in_mb = sum(_op_weight_size_in_mb(op) for op in main_block.operations)
+    def _op_weight_size_in_mb(op) -> float:
+        size = 0.0
+        for inp in op.inputs.values():
+            if isinstance(inp, (list, tuple)):
+                for v in inp:
+                    size += _collect_const_size(v)
+            else:
+                size += _collect_const_size(inp)
+        return size
+
+    op_sizes = [
+        _op_weight_size_in_mb(op) for op in main_block.operations
+    ]
+    total_size_in_mb = sum(op_sizes)
     half_size = total_size_in_mb / 2
 
     cumulative_size_in_mb = 0.0
-    for op in main_block.operations:
-        cumulative_size_in_mb += _op_weight_size_in_mb(op)
+    for op, size in zip(main_block.operations, op_sizes):
+        cumulative_size_in_mb += size
 
         # Select a non-const op (single child) once the cumulative size exceeds half
         if (cumulative_size_in_mb > half_size and not op.op_type.startswith("const")
@@ -224,7 +239,7 @@ def _make_second_chunk_prog(prog, op_idx):
     """ Build second chunk by rebuilding a pristine MIL Program from MLModel
     """
     block = prog.functions["main"]
-    block.opset_version = ct.target.iOS16
+    block.opset_version = ct.target.iOS17
 
     # First chunk outputs are second chunk inputs (e.g. skip connections)
     boundary_vars = _get_first_chunk_outputs(block, op_idx)
@@ -333,7 +348,7 @@ def _legacy_model_chunking(args):
         prog_chunk1,
         convert_to="mlprogram",
         compute_units=ct.ComputeUnit.CPU_ONLY,
-        minimum_deployment_target=ct.target.iOS16,
+        minimum_deployment_target=ct.target.iOS17,
     )
     del prog_chunk1
     gc.collect()
@@ -343,7 +358,7 @@ def _legacy_model_chunking(args):
         prog_chunk2,
         convert_to="mlprogram",
         compute_units=ct.ComputeUnit.CPU_ONLY,
-        minimum_deployment_target=ct.target.iOS16,
+        minimum_deployment_target=ct.target.iOS17,
     )
     del prog_chunk2
     gc.collect()
