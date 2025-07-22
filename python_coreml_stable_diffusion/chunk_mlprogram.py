@@ -176,7 +176,7 @@ def _get_op_idx_split_location(prog: Program):
         _op_weight_size_in_mb(op) for op in main_block.operations
     ]
     total_size_in_mb = sum(op_sizes)
-    half_size = total_size_in_mb / 2
+    half_size = total_size_in_mb * 0.625
 
     cumulative_size_in_mb = 0.0
     for op, size in zip(main_block.operations, op_sizes):
