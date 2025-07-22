@@ -267,10 +267,6 @@ def _prepare_calibration(pipe, args, calib_dir):
 def convert_quantized_unet(pipe, args):
     """Quantize `pipe.unet` and convert it to Core ML."""
     out_path = torch2coreml._get_out_path(args, "unet")
-<<<<<<< HEAD
-
-=======
->>>>>>> parent of 3f13c32 (Merge pull request #17 from china-mashina/codex/explain-chunk_mlprogram.py-legacy-split-method)
     if os.path.exists(out_path):
         logger.info(f"`unet` already exists at {out_path}, skipping conversion.")
         return

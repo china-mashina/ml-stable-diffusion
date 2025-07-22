@@ -98,34 +98,88 @@ def _load_prog_from_mlmodel(model):
 
 
 def _get_op_idx_split_location(prog: Program):
-    """ Find the op that approximately bisects the graph as measure by weights size on each side
+    """Find an op index that approximately bisects the graph by weight usage.
+
+    The previous implementation walked backwards from every op to collect the
+    set of constant ancestors.  That approach had quadratic memory usage in the
+    number of ops, which caused the process to get killed for large, quantized
+    models.  This version performs a forward BFS starting from each constant or
+    ``constexpr_*`` op to determine the earliest and latest op indices that
+    actually consume that constant.  Weight sizes are accumulated using a
+    prefix-sum array which keeps memory usage roughly linear in the number of
+    operations.
     """
+
     main_block = prog.functions["main"]
     main_block.operations = list(main_block.operations)
-    total_size_in_mb = 0
 
-    for op in main_block.operations:
-        if op.op_type == "const" and isinstance(op.val.val, np.ndarray):
-            size_in_mb = op.val.val.size * op.val.val.itemsize / (1024 * 1024)
-            total_size_in_mb += size_in_mb
-    half_size = total_size_in_mb / 2
+    ops = main_block.operations
+    op_to_idx = {op: idx for idx, op in enumerate(ops)}
 
-    # Find the first non const op (single child), where the total cumulative size exceeds
-    # the half size for the first time
-    cumulative_size_in_mb = 0
-    for op in main_block.operations:
-        if op.op_type == "const" and isinstance(op.val.val, np.ndarray):
-            size_in_mb = op.val.val.size * op.val.val.itemsize / (1024 * 1024)
-            cumulative_size_in_mb += size_in_mb
+    # Track weight memory introduced / released at each op index
+    weight_deltas = [0.0] * (len(ops) + 1)
+    total_size_in_mb = 0.0
 
-        # Note: The condition "not op.op_type.startswith("const")" is to make sure that the
-        # incision op is neither of type "const" nor "constexpr_*" ops that
-        # are used to store compressed weights
-        if (cumulative_size_in_mb > half_size and not op.op_type.startswith("const")
-                and len(op.outputs) == 1
-                and len(op.outputs[0].child_ops) == 1):
-            op_idx = main_block.operations.index(op)
-            return op_idx, cumulative_size_in_mb, total_size_in_mb
+    passthrough_ops = {"quantize", "dequantize", "reshape", "cast"}
+
+    for op in ops:
+        is_const = op.op_type == "const" or op.op_type.startswith("constexpr_")
+        if not is_const:
+            continue
+
+        # Compute size of the constant weight(s) produced by this op
+        size_in_mb = 0.0
+        for out in op.outputs:
+            if out.val is not None and isinstance(out.val.val, np.ndarray):
+                arr = out.val.val
+                size_in_mb += arr.size * arr.itemsize / (1024 * 1024)
+
+        if size_in_mb == 0.0:
+            continue
+
+        total_size_in_mb += size_in_mb
+
+        visited = set()
+        q = []
+        for out in op.outputs:
+            q.extend(out.child_ops)
+
+        first_idx = None
+        last_idx = None
+        while q:
+            child = q.pop(0)
+            if child in visited:
+                continue
+            visited.add(child)
+            if child.op_type in passthrough_ops:
+                for out in child.outputs:
+                    q.extend(out.child_ops)
+                continue
+
+            idx = op_to_idx[child]
+            if first_idx is None or idx < first_idx:
+                first_idx = idx
+            if last_idx is None or idx > last_idx:
+                last_idx = idx
+
+        if first_idx is None:
+            continue
+
+        weight_deltas[first_idx] += size_in_mb
+        weight_deltas[last_idx + 1] -= size_in_mb
+
+    half_size = total_size_in_mb / 2.0
+
+    active_weight = 0.0
+    for idx, op in enumerate(ops):
+        active_weight += weight_deltas[idx]
+        if (
+            active_weight >= half_size
+            and not op.op_type.startswith("const")
+            and len(op.outputs) == 1
+            and len(op.outputs[0].child_ops) == 1
+        ):
+            return idx, active_weight, total_size_in_mb
 
 
 def _get_first_chunk_outputs(block, op_idx):
