@@ -194,7 +194,8 @@ def _get_first_chunk_outputs(block, op_idx):
     # Get the list of all vars that go across from first program (all ops from 0 to op_idx (inclusive))
     # to the second program (all ops from op_idx+1 till the end). These all vars need to be made the output
     # of the first program and the input of the second program
-    boundary_vars = set()
+    boundary_vars = []
+    boundary_vars_set = set()
     block.operations = list(block.operations)
     for i in range(op_idx + 1):
         op = block.operations[i]
@@ -204,8 +205,11 @@ def _get_first_chunk_outputs(block, op_idx):
                     for child_op in var.child_ops:
                         child_op_idx = block.operations.index(child_op)
                         if child_op_idx > op_idx:
-                            boundary_vars.add(var)
-    return list(boundary_vars)
+                            if var not in boundary_vars_set:
+                                boundary_vars.append(var)
+                                boundary_vars_set.add(var)
+    # Ensure deterministic ordering
+    return boundary_vars
 
 
 @block_context_manager
