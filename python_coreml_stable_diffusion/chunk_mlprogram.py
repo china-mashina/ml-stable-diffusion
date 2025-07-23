@@ -194,22 +194,27 @@ def _get_first_chunk_outputs(block, op_idx):
     # Get the list of all vars that go across from first program (all ops from 0 to op_idx (inclusive))
     # to the second program (all ops from op_idx+1 till the end). These all vars need to be made the output
     # of the first program and the input of the second program
-    boundary_vars = []
-    boundary_vars_set = set()
+    boundary_var_indices = {}
     block.operations = list(block.operations)
     for i in range(op_idx + 1):
         op = block.operations[i]
-        if not op.op_type.startswith("const"):
-            for var in op.outputs:
-                if var.val is None:  # only consider non const vars
-                    for child_op in var.child_ops:
-                        child_op_idx = block.operations.index(child_op)
-                        if child_op_idx > op_idx:
-                            if var not in boundary_vars_set:
-                                boundary_vars.append(var)
-                                boundary_vars_set.add(var)
-    # Ensure deterministic ordering
-    return boundary_vars
+        if op.op_type.startswith("const"):
+            continue
+        for var in op.outputs:
+            if var.val is not None:
+                continue
+            for child_op in var.child_ops:
+                child_op_idx = block.operations.index(child_op)
+                if child_op_idx > op_idx:
+                    if var not in boundary_var_indices:
+                        boundary_var_indices[var] = child_op_idx
+                    else:
+                        boundary_var_indices[var] = min(
+                            boundary_var_indices[var], child_op_idx)
+    # Ensure deterministic ordering by the earliest boundary crossing
+    sorted_vars = sorted(
+        boundary_var_indices.items(), key=lambda kv: kv[1])
+    return [var for var, _ in sorted_vars]
 
 
 @block_context_manager
