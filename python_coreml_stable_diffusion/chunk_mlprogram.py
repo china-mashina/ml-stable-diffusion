@@ -194,24 +194,28 @@ def _get_first_chunk_outputs(block, op_idx):
     # Get the list of all vars that go across from first program (all ops from 0 to op_idx (inclusive))
     # to the second program (all ops from op_idx+1 till the end). These all vars need to be made the output
     # of the first program and the input of the second program
-    boundary_var_indices = {}
     block.operations = list(block.operations)
-    for i in range(op_idx + 1):
-        op = block.operations[i]
+
+    # Cache op positions to avoid repeated list lookups
+    op_positions = {op: idx for idx, op in enumerate(block.operations)}
+
+    # Track the first producing op index for each boundary var
+    boundary_var_indices = {}
+    for idx in range(op_idx + 1):
+        op = block.operations[idx]
         if op.op_type.startswith("const"):
             continue
         for var in op.outputs:
             if var.val is not None:
                 continue
             for child_op in var.child_ops:
-                child_op_idx = block.operations.index(child_op)
+                child_op_idx = op_positions[child_op]
                 if child_op_idx > op_idx:
                     if var not in boundary_var_indices:
-                        boundary_var_indices[var] = child_op_idx
-                    else:
-                        boundary_var_indices[var] = min(
-                            boundary_var_indices[var], child_op_idx)
-    # Ensure deterministic ordering by the earliest boundary crossing
+                        boundary_var_indices[var] = idx
+                    break
+
+    # Sort by the producer op index for deterministic ordering
     sorted_vars = sorted(
         boundary_var_indices.items(), key=lambda kv: kv[1])
     return [var for var, _ in sorted_vars]
