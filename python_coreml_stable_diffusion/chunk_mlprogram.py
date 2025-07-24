@@ -79,6 +79,28 @@ def _verify_output_correctness_of_chunks(full_model,
             log_prefix=f"{out_name}")
 
 
+def _chunk_io_match(first_chunk_model, second_chunk_model):
+    """Return ``True`` if every output of ``first_chunk_model`` that is fed to
+    ``second_chunk_model`` has the same shape and dtype."""
+
+    out_desc = {o.name: o for o in first_chunk_model._spec.description.output}
+    in_desc = {i.name: i for i in second_chunk_model._spec.description.input}
+
+    for name, o in out_desc.items():
+        if name in in_desc:
+            i = in_desc[name]
+            o_shape = list(o.type.multiArrayType.shape)
+            i_shape = list(i.type.multiArrayType.shape)
+            o_dt = o.type.multiArrayType.dataType
+            i_dt = i.type.multiArrayType.dataType
+            if o_shape != i_shape or o_dt != i_dt:
+                return False
+        else:
+            return False
+
+    return True
+
+
 def _load_prog_from_mlmodel(model):
     """ Load MIL Program from an MLModel
     """
@@ -97,8 +119,16 @@ def _load_prog_from_mlmodel(model):
     return prog
 
 
-def _get_op_idx_split_location(prog: Program):
+def _get_op_idx_split_location(prog: Program, ratio: float = 0.625):
     """Find the op that approximately bisects the graph by weight size.
+
+    Parameters
+    ----------
+    prog: Program
+        The MIL program to analyze.
+    ratio: float
+        Fraction of the total weight size that should be allocated to the first
+        chunk.  Defaults to ``0.625`` which mirrors the previous constant.
 
     Quantized models often encode parameters via ``constexpr_*`` operations
     rather than plain ``const`` ops.  The original implementation ignored these
@@ -176,7 +206,7 @@ def _get_op_idx_split_location(prog: Program):
         _op_weight_size_in_mb(op) for op in main_block.operations
     ]
     total_size_in_mb = sum(op_sizes)
-    half_size = total_size_in_mb * 0.625
+    half_size = total_size_in_mb * ratio
 
     cumulative_size_in_mb = 0.0
     for op, size in zip(main_block.operations, op_sizes):
@@ -293,7 +323,21 @@ def _make_second_chunk_prog(prog, op_idx):
     return prog
 
 
-def _legacy_model_chunking(args):
+def _legacy_model_chunking(args, ratio: float = 0.625, return_models: bool = False):
+    """Chunk the given Core ML model into two pieces.
+
+    Parameters
+    ----------
+    args: argparse.Namespace
+        Command line arguments parsed for this script.
+    ratio: float, optional
+        Fraction of the weight size allocated to the first chunk. Defaults to
+        ``0.625`` for backward compatibility.
+    return_models: bool, optional
+        If ``True`` the two ``MLModel`` objects are returned instead of being
+        saved to disk.
+    """
+
     # TODO: Remove this method after setting the coremltools dependency >= 8.0
     os.makedirs(args.o, exist_ok=True)
 
@@ -318,7 +362,7 @@ def _legacy_model_chunking(args):
 
     # Compute the incision point by bisecting the program based on weights size
     op_idx, first_chunk_weights_size, total_weights_size = _get_op_idx_split_location(
-        prog)
+        prog, ratio)
     main_block = prog.functions["main"]
     incision_op = main_block.operations[op_idx]
     logger.info(f"{args.mlpackage_path} will chunked into two pieces.")
@@ -373,6 +417,9 @@ def _legacy_model_chunking(args):
             second_chunk_model=model_chunk2,
         )
 
+    if return_models:
+        return model_chunk1, model_chunk2
+
     if args.merge_chunks_in_pipeline_model:
         # Make a single pipeline model to manage the model chunks
         pipeline_model = ct.utils.make_pipeline(model_chunk1, model_chunk2)
@@ -399,6 +446,35 @@ def _legacy_model_chunking(args):
         model_chunk1.save(out_path_chunk1)
         model_chunk2.save(out_path_chunk2)
         logger.info("Done.")
+
+
+def iterate_until_mismatch(args, start: float = 0.6, end: float = 0.7, step: float = 0.01):
+    """Run chunking repeatedly with varying split ratios until IO mismatch.
+
+    Parameters
+    ----------
+    args: argparse.Namespace
+        Arguments for ``_legacy_model_chunking``.
+    start, end, step: float
+        Range of ratios to test.  Defaults to ``0.6`` .. ``0.7`` inclusive with
+        ``0.01`` increments.
+    """
+
+    ratio = start
+    while ratio <= end:
+        logger.info(f"Testing split ratio {ratio:.3f}")
+        model_chunk1, model_chunk2 = _legacy_model_chunking(
+            args, ratio=ratio, return_models=True
+        )
+
+        if not _chunk_io_match(model_chunk1, model_chunk2):
+            logger.info(f"Mismatch detected for ratio {ratio:.3f}")
+            return ratio
+
+        ratio = round(ratio + step, 3)
+
+    logger.info("No mismatch found in the specified range")
+    return None
 
 
 def main(args):
