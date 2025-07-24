@@ -191,21 +191,49 @@ def _get_op_idx_split_location(prog: Program):
 
 
 def _get_first_chunk_outputs(block, op_idx):
-    # Get the list of all vars that go across from first program (all ops from 0 to op_idx (inclusive))
-    # to the second program (all ops from op_idx+1 till the end). These all vars need to be made the output
-    # of the first program and the input of the second program
-    boundary_vars = set()
+    """Return variables that flow from the first chunk into the second in a
+    deterministic order.
+    """
+    # Get the list of all vars that go across from first program (all ops from 0 to
+    # op_idx (inclusive)) to the second program (all ops from op_idx+1 till the
+    # end). These vars need to be outputs of the first program and inputs of the
+    # second program.
+
     block.operations = list(block.operations)
-    for i in range(op_idx + 1):
-        op = block.operations[i]
-        if not op.op_type.startswith("const"):
-            for var in op.outputs:
-                if var.val is None:  # only consider non const vars
-                    for child_op in var.child_ops:
-                        child_op_idx = block.operations.index(child_op)
-                        if child_op_idx > op_idx:
-                            boundary_vars.add(var)
-    return list(boundary_vars)
+
+    # Cache op positions to avoid repeated list lookups
+    op_positions = {op: idx for idx, op in enumerate(block.operations)}
+
+    # Track metadata for each boundary var: (producer_idx, first_consumer_idx)
+    var_meta = {}
+
+    for idx in range(op_idx + 1):
+        op = block.operations[idx]
+        if op.op_type.startswith("const"):
+            continue
+        for var in op.outputs:
+            if var.val is not None:
+                continue
+
+            consumer_idx = None
+            for child_op in var.child_ops:
+                child_op_idx = op_positions[child_op]
+                if child_op_idx > op_idx:
+                    if consumer_idx is None or child_op_idx < consumer_idx:
+                        consumer_idx = child_op_idx
+            if consumer_idx is not None:
+                if var not in var_meta:
+                    var_meta[var] = (idx, consumer_idx)
+                else:
+                    prod_idx, first_cons_idx = var_meta[var]
+                    var_meta[var] = (
+                        min(prod_idx, idx),
+                        min(first_cons_idx, consumer_idx),
+                    )
+
+    # Sort by producer index, then by first consumer index for deterministic ordering
+    sorted_vars = sorted(var_meta.items(), key=lambda kv: (kv[1][0], kv[1][1]))
+    return [var for var, _ in sorted_vars]
 
 
 @block_context_manager
