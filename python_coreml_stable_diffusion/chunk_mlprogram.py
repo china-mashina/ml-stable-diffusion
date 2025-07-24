@@ -29,6 +29,7 @@ import os
 from python_coreml_stable_diffusion import torch2coreml
 import shutil
 import time
+import tempfile
 
 
 def _verify_output_correctness_of_chunks(full_model,
@@ -293,6 +294,70 @@ def _make_second_chunk_prog(prog, op_idx):
     return prog
 
 
+def _mlpackage_dir_size_in_mb(path: str) -> float:
+    """Return the total size of an .mlpackage directory in megabytes."""
+    total = 0
+    for root_dir, _, files in os.walk(path):
+        for fname in files:
+            fp = os.path.join(root_dir, fname)
+            total += os.path.getsize(fp)
+    return total / (1024 * 1024)
+
+
+def _measure_candidate_split(model, op_idx):
+    """Convert candidate split and return resulting chunk sizes in MB."""
+    prog_chunk1 = _make_first_chunk_prog(_load_prog_from_mlmodel(model), op_idx)
+    prog_chunk2 = _make_second_chunk_prog(_load_prog_from_mlmodel(model), op_idx)
+
+    model_chunk1 = ct.convert(
+        prog_chunk1,
+        convert_to="mlprogram",
+        compute_units=ct.ComputeUnit.CPU_ONLY,
+        minimum_deployment_target=ct.target.iOS17,
+    )
+    model_chunk2 = ct.convert(
+        prog_chunk2,
+        convert_to="mlprogram",
+        compute_units=ct.ComputeUnit.CPU_ONLY,
+        minimum_deployment_target=ct.target.iOS17,
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        c1 = os.path.join(tmpdir, "c1.mlpackage")
+        c2 = os.path.join(tmpdir, "c2.mlpackage")
+        model_chunk1.save(c1)
+        model_chunk2.save(c2)
+        size1 = _mlpackage_dir_size_in_mb(c1)
+        size2 = _mlpackage_dir_size_in_mb(c2)
+
+    return size1, size2
+
+
+def _find_best_split(model, initial_op_idx, total_ops):
+    """Search nearby ops for a split that balances chunk file sizes."""
+    candidate_offsets = [0, -5, 5, -10, 10]
+    best_idx = initial_op_idx
+    best_diff = float("inf")
+
+    for off in candidate_offsets:
+        idx = initial_op_idx + off
+        if idx <= 0 or idx >= total_ops - 1:
+            continue
+        size1, size2 = _measure_candidate_split(model, idx)
+        diff = abs(size1 - size2)
+        logger.info(
+            f"Candidate split index {idx}: chunk sizes {size1:.2f} MB vs {size2:.2f} MB"
+        )
+        if diff < best_diff:
+            best_diff = diff
+            best_idx = idx
+
+    if best_idx != initial_op_idx:
+        logger.info(f"Selected new split index {best_idx} to better balance chunk sizes")
+
+    return best_idx
+
+
 def _legacy_model_chunking(args):
     # TODO: Remove this method after setting the coremltools dependency >= 8.0
     os.makedirs(args.o, exist_ok=True)
@@ -330,12 +395,14 @@ def _legacy_model_chunking(args):
         f"Second chunk size = {total_weights_size - first_chunk_weights_size:.2f} MB"
     )
 
+    # Optionally adjust the split point to balance final chunk sizes
+    op_idx = _find_best_split(model, op_idx, len(main_block.operations))
+
     # Build first chunk (in-place modifies prog by declaring early exits and removing unused subgraph)
-    prog_chunk1 = _make_first_chunk_prog(prog, op_idx)
+    prog_chunk1 = _make_first_chunk_prog(_load_prog_from_mlmodel(model), op_idx)
 
     # Build the second chunk
-    prog_chunk2 = _make_second_chunk_prog(_load_prog_from_mlmodel(model),
-                                          op_idx)
+    prog_chunk2 = _make_second_chunk_prog(_load_prog_from_mlmodel(model), op_idx)
 
     if not args.check_output_correctness:
         # Original model no longer needed in memory
