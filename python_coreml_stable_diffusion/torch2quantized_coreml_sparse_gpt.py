@@ -10,9 +10,7 @@ import gc
 import logging
 import os
 import pickle
-import operator
 from collections import OrderedDict
-from copy import deepcopy
 
 import coremltools as ct
 import numpy as np
@@ -59,21 +57,38 @@ class MultiInputCacher(FirstLayerInputCacher):
 
     def cache(self, dataloader, nsamples, device):
         inputs = []
+        kwarg_inputs = {}
         sampled = 0
         for batch in dataloader:
-            tensor_batch = []
-            for item in batch:
-                if torch.is_tensor(item):
-                    tensor_batch.append(item.to(device))
-                else:
-                    tensor_batch.append(item)
-            inputs.append(tuple(tensor_batch))
+            batch = list(batch)
+            sample = batch[0].to(device) if torch.is_tensor(batch[0]) else batch[0]
+            inputs.append(sample)
+
+            if len(batch) > 1:
+                kwarg_inputs["timestep"] = (
+                    batch[1].to(device) if torch.is_tensor(batch[1]) else batch[1]
+                )
+            if len(batch) > 2:
+                kwarg_inputs["encoder_hidden_states"] = (
+                    batch[2].to(device) if torch.is_tensor(batch[2]) else batch[2]
+                )
+            if len(batch) > 3:
+                kwarg_inputs["time_ids"] = (
+                    batch[3].to(device) if torch.is_tensor(batch[3]) else batch[3]
+                )
+            if len(batch) > 4:
+                kwarg_inputs["text_embeds"] = (
+                    batch[4].to(device) if torch.is_tensor(batch[4]) else batch[4]
+                )
+
             sampled += 1
             if sampled == nsamples:
                 break
-        return inputs, {}
 
-with open('prompts.txt', 'r', encoding='utf-8') as f:
+        return inputs, kwarg_inputs
+
+
+with open("prompts.txt", "r", encoding="utf-8") as f:
     CALIBRATION_DATA = [line.strip() for line in f.readlines()]
 
 
@@ -224,14 +239,14 @@ def quantize(model, config, calibration_data):
     config.non_traceable_module_names = non_traceable
     config.preserved_attributes = ["config", "device"]
 
-    sample_input = _to_coreml_unet_inputs(*calibration_data[0])
+    sample_input = calibration_data[0]
     for i, t in enumerate(sample_input):
         _log_device(f"Sample input tensor {i}", t)
     device = sample_input[0].device
 
     def dataloader():
         for data in calibration_data:
-            yield _to_coreml_unet_inputs(*data)
+            yield data
 
     compressor = LayerwiseCompressor(model, config)
     logger.info("Compressing model with SparseGPT")
@@ -276,9 +291,7 @@ def convert_quantized_unet(pipe, args):
         return
 
     # Calibration data
-    calib_dir = os.path.join(
-        args.o, f"calibration_data"
-    )
+    calib_dir = os.path.join(args.o, f"calibration_data")
     dataloader = _prepare_calibration(pipe, args, calib_dir)
 
     # Create a reference UNet and gather text encoder metadata before
@@ -345,7 +358,6 @@ def convert_quantized_unet(pipe, args):
         args.latent_h or quant_unet.config.sample_size,
         args.latent_w or quant_unet.config.sample_size,
     )
-
 
     encoder_hidden_states_shape = (
         batch_size,
@@ -445,6 +457,7 @@ def convert_quantized_unet(pipe, args):
         args.merge_chunks_in_pipeline_model = False
         chunk_mlprogram.main(args)
 
+
 def chunk_unet(args):
     out_path = torch2coreml._get_out_path(args, "unet")
     unet_chunks_exist = all(
@@ -457,7 +470,8 @@ def chunk_unet(args):
         args.remove_original = False
         args.merge_chunks_in_pipeline_model = False
         chunk_mlprogram.main(args)
-        
+
+
 def main(args):
     os.makedirs(args.o, exist_ok=True)
 
@@ -481,12 +495,12 @@ def main(args):
     unet_mod.ATTENTION_IMPLEMENTATION_IN_EFFECT = unet_mod.AttentionImplementations[
         args.attention_implementation
     ]
-    
+
     if args.convert_unet:
         convert_quantized_unet(pipe, args)
         del pipe
         gc.collect()
-    
+
     if args.chunk_unet:
         chunk_unet(args)
 
@@ -513,5 +527,3 @@ def parser_spec():
         help="Run calibration data generation on a single prompt",
     )
     return parser
-
-
