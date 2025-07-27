@@ -17,6 +17,14 @@ from copy import deepcopy
 import coremltools as ct
 import numpy as np
 import torch
+import torch.nn.utils.prune as prune
+
+try:
+    import sparsegpt
+    HAS_SPARSEGPT = True
+except Exception:  # noqa: BLE001
+    sparsegpt = None
+    HAS_SPARSEGPT = False
 from coremltools.optimize.torch.quantization import (
     LinearQuantizer,
     LinearQuantizerConfig,
@@ -249,6 +257,29 @@ def quantize(model, config, calibration_data):
     return quantized_model
 
 
+def sparsegpt_quantize(model, sparsity):
+    """Apply SparseGPT-style pruning to ``model``.
+
+    If the ``sparsegpt`` package is available and exposes a ``prune_model``
+    function, it will be used. Otherwise the function falls back to L1
+    unstructured pruning from ``torch.nn.utils.prune``.
+    """
+    if sparsity <= 0:
+        return model
+
+    if HAS_SPARSEGPT and hasattr(sparsegpt, "prune_model"):
+        logger.info("Pruning model with SparseGPT")
+        sparsegpt.prune_model(model, sparsity)
+    else:
+        if not HAS_SPARSEGPT:
+            logger.warning("SparseGPT not available, using magnitude pruning")
+        for module in model.modules():
+            if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
+                prune.l1_unstructured(module, name="weight", amount=sparsity)
+                prune.remove(module, "weight")
+    return model
+
+
 def _prepare_calibration(pipe, args, calib_dir):
     """Generate calibration data if needed and return dataloader."""
     if args.generate_calibration_data or not os.path.exists(calib_dir):
@@ -341,6 +372,7 @@ def convert_quantized_unet(pipe, args):
     _log_device("Reference UNet", reference_unet)
 
     quant_unet = quantize(reference_unet, config, dataloader)
+    quant_unet = sparsegpt_quantize(quant_unet, args.sparsegpt_sparsity)
     # reference_unet and calibration data are no longer needed
     del reference_unet, dataloader
     gc.collect()
@@ -520,6 +552,12 @@ def parser_spec():
         "--test",
         action="store_true",
         help="Run calibration data generation on a single prompt",
+    )
+    parser.add_argument(
+        "--sparsegpt-sparsity",
+        type=float,
+        default=0.0,
+        help="Proportion of weights to prune using SparseGPT (0 disables)",
     )
     return parser
 
