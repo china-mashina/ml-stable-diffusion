@@ -21,9 +21,6 @@ from coremltools.optimize.torch.layerwise_compression import (
     LayerwiseCompressor,
     LayerwiseCompressorConfig,
 )
-from coremltools.optimize.torch.layerwise_compression.algorithms import (
-    ModuleSparseGPTConfig,
-)
 from coremltools.optimize.torch.quantization import (
     LinearQuantizer,
     LinearQuantizerConfig,
@@ -271,7 +268,12 @@ def quantize(model, config, calibration_data):
 
 
 def sparsegpt_pruning(model, dataloader, sparsity):
-    """Prune ``model`` weights using SparseGPT via coremltools."""
+    """Prune ``model`` weights using SparseGPT via coremltools.
+
+    The dataloader must contain the same samples used during activation
+    quantization. Each sample is converted with ``_to_coreml_unet_inputs`` so
+    the compressor receives inputs in the exact format expected by the model.
+    """
 
     if sparsity <= 0:
         return model
@@ -293,9 +295,11 @@ def sparsegpt_pruning(model, dataloader, sparsity):
     compressor = LayerwiseCompressor(model, config)
 
     # ``compress`` expects an iterable of inputs that can be directly passed to
-    # the model. ``unet_data_loader`` returns lists, so convert them to tuples to
-    # match the model's call signature.
-    calibration_loader = [tuple(sample) for sample in dataloader]
+    # the model. ``unet_data_loader`` returns lists, so convert them to tuples
+    # with the same transformation applied during quantization.
+    calibration_loader = [
+        _to_coreml_unet_inputs(*sample) for sample in dataloader
+    ]
 
     device = next(model.parameters()).device
     compressed_model = compressor.compress(
