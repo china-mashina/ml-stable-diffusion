@@ -17,6 +17,7 @@ from copy import deepcopy
 import coremltools as ct
 import numpy as np
 import torch
+from typing import Iterable
 from coremltools.optimize.torch.layerwise_compression import (
     LayerwiseCompressor,
     LayerwiseCompressorConfig,
@@ -38,6 +39,26 @@ from python_coreml_stable_diffusion.unet import Einsum
 logging.basicConfig()
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+
+class TensorTuple(list):
+    """Container for UNet inputs compatible with ``LayerwiseCompressor``."""
+
+    def to(self, device: str):
+        return TensorTuple(
+            [x.to(device) if torch.is_tensor(x) else x for x in self]
+        )
+
+
+class UNetWrapper(torch.nn.Module):
+    """Wrap UNet so ``LayerwiseCompressor`` can call it with a single argument."""
+
+    def __init__(self, unet: torch.nn.Module):
+        super().__init__()
+        self.unet = unet
+
+    def forward(self, batch: Iterable[torch.Tensor]):
+        return self.unet(*batch)
 
 
 def _log_device(name, obj):
@@ -150,7 +171,9 @@ def unet_data_loader(data_dir, device="cpu", calibration_nsamples=None):
                         unet_data = pickle.load(data)
                         for inp in unet_data:
                             dataloader.append(
-                                [x.to(torch.float32).to(device) for x in inp]
+                                TensorTuple([
+                                    x.to(torch.float32).to(device) for x in inp
+                                ])
                             )
                             for i, t in enumerate(dataloader[-1]):
                                 _log_device(
@@ -292,20 +315,19 @@ def sparsegpt_pruning(model, dataloader, sparsity):
         }
     )
 
-    compressor = LayerwiseCompressor(model, config)
+    wrapped_model = UNetWrapper(model)
+    compressor = LayerwiseCompressor(wrapped_model, config)
 
     # ``compress`` expects an iterable of inputs that can be directly passed to
-    # the model. ``unet_data_loader`` returns lists, so convert them to tuples
-    # with the same transformation applied during quantization.
+    # the model. Convert calibration samples to ``TensorTuple`` so they can be
+    # moved to the requested device and unpacked by ``UNetWrapper``.
     calibration_loader = [
-        _to_coreml_unet_inputs(*sample) for sample in dataloader
+        TensorTuple(_to_coreml_unet_inputs(*sample)) for sample in dataloader
     ]
 
     device = next(model.parameters()).device
-    compressed_model = compressor.compress(
-        calibration_loader, device=str(device), inplace=True
-    )
-    return compressed_model
+    compressor.compress(calibration_loader, device=str(device), inplace=True)
+    return model
 
 
 def _prepare_calibration(pipe, args, calib_dir):
