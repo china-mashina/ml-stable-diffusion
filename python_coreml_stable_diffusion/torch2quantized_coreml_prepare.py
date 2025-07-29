@@ -17,14 +17,13 @@ from copy import deepcopy
 import coremltools as ct
 import numpy as np
 import torch
-import torch.nn.utils.prune as prune
-
-try:
-    import sparsegpt
-    HAS_SPARSEGPT = True
-except Exception:  # noqa: BLE001
-    sparsegpt = None
-    HAS_SPARSEGPT = False
+from coremltools.optimize.torch.layerwise_compression import (
+    LayerwiseCompressor,
+    LayerwiseCompressorConfig,
+)
+from coremltools.optimize.torch.layerwise_compression.algorithms import (
+    ModuleSparseGPTConfig,
+)
 from coremltools.optimize.torch.quantization import (
     LinearQuantizer,
     LinearQuantizerConfig,
@@ -257,27 +256,31 @@ def quantize(model, config, calibration_data):
     return quantized_model
 
 
-def sparsegpt_quantize(model, sparsity):
-    """Apply SparseGPT-style pruning to ``model``.
+def sparsegpt_quantize(model, dataloader, sparsity):
+    """Prune ``model`` weights using SparseGPT via coremltools."""
 
-    If the ``sparsegpt`` package is available and exposes a ``prune_model``
-    function, it will be used. Otherwise the function falls back to L1
-    unstructured pruning from ``torch.nn.utils.prune``.
-    """
     if sparsity <= 0:
         return model
 
-    if HAS_SPARSEGPT and hasattr(sparsegpt, "prune_model"):
-        logger.info("Pruning model with SparseGPT")
-        sparsegpt.prune_model(model, sparsity)
-    else:
-        if not HAS_SPARSEGPT:
-            logger.warning("SparseGPT not available, using magnitude pruning")
-        for module in model.modules():
-            if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
-                prune.l1_unstructured(module, name="weight", amount=sparsity)
-                prune.remove(module, "weight")
-    return model
+    logger.info("Pruning model with SparseGPT")
+
+    config = LayerwiseCompressorConfig.from_dict(
+        {
+            "global_config": {
+                "algorithm": "sparse_gpt",
+                "target_sparsity": sparsity,
+                "weight_dtype": "float32",
+            },
+            "input_cacher": "default",
+            "calibration_nsamples": len(dataloader),
+        }
+    )
+
+    compressor = LayerwiseCompressor(model, config)
+
+    device = next(model.parameters()).device
+    compressed_model = compressor.compress(dataloader, device=str(device), inplace=True)
+    return compressed_model
 
 
 def _prepare_calibration(pipe, args, calib_dir):
@@ -337,6 +340,7 @@ def convert_quantized_unet(pipe, args):
     ).eval()
     reference_unet.load_state_dict(pipe.unet.state_dict())
     reference_unet.to("cpu")
+    reference_unet.config.use_cache = False
 
     if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
         text_token_sequence_length = pipe.text_encoder.config.max_position_embeddings
@@ -372,7 +376,8 @@ def convert_quantized_unet(pipe, args):
     _log_device("Reference UNet", reference_unet)
 
     quant_unet = quantize(reference_unet, config, dataloader)
-    quant_unet = sparsegpt_quantize(quant_unet, args.sparsegpt_sparsity)
+    quant_unet.config.use_cache = False
+    quant_unet = sparsegpt_quantize(quant_unet, dataloader, args.sparsegpt_sparsity)
     # reference_unet and calibration data are no longer needed
     del reference_unet, dataloader
     gc.collect()
