@@ -59,35 +59,16 @@ def _log_device(name, obj):
 
 torch.set_grad_enabled(False)
 
-# A small mix of long and short prompts used to generate calibration samples.
-# Each entry is a tuple of ``(prompt, negative_prompt)`` where
-# ``negative_prompt`` can be an empty string.
-CALIBRATION_DATA = [
-    (
-        "A high quality photo of an astronaut riding a horse on Mars",
-        "",
-    ),
-    (
-        "black cat",
-        "",
-    ),
-    (
-        "Beautiful landscape with mountains at sunset",
-        "ugly",
-    ),
-    (
-        "portrait of a young woman, cinematic lighting",
-        "low quality",
-    ),
-    (
-        "space rocket launch",
-        "",
-    ),
-    (
-        "colorful abstract shapes",
-        "unrealistic",
-    ),
-]
+# Load prompts and optional negative prompts used to generate calibration data.
+with open("prompts.txt", "r", encoding="utf-8") as f:
+    prompts = [line.strip() for line in f.readlines()]
+
+with open("negative_prompts.txt", "r", encoding="utf-8") as f:
+    negative_prompts = [line.strip() for line in f.readlines()]
+
+# Pair each prompt with the corresponding negative prompt. If a negative prompt
+# line is empty, an empty string will be used during generation.
+CALIBRATION_DATA = list(zip(prompts, negative_prompts))
 
 
 def register_input_log_hook(unet, inputs):
@@ -311,8 +292,15 @@ def sparsegpt_pruning(model, dataloader, sparsity):
 
     compressor = LayerwiseCompressor(model, config)
 
+    # ``compress`` expects an iterable of inputs that can be directly passed to
+    # the model. ``unet_data_loader`` returns lists, so convert them to tuples to
+    # match the model's call signature.
+    calibration_loader = [tuple(sample) for sample in dataloader]
+
     device = next(model.parameters()).device
-    compressed_model = compressor.compress(dataloader, device=str(device), inplace=True)
+    compressed_model = compressor.compress(
+        calibration_loader, device=str(device), inplace=True
+    )
     return compressed_model
 
 
