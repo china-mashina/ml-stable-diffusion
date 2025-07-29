@@ -59,8 +59,35 @@ def _log_device(name, obj):
 
 torch.set_grad_enabled(False)
 
-with open('prompts.txt', 'r', encoding='utf-8') as f:
-    CALIBRATION_DATA = [line.strip() for line in f.readlines()]
+# A small mix of long and short prompts used to generate calibration samples.
+# Each entry is a tuple of ``(prompt, negative_prompt)`` where
+# ``negative_prompt`` can be an empty string.
+CALIBRATION_DATA = [
+    (
+        "A high quality photo of an astronaut riding a horse on Mars",
+        "",
+    ),
+    (
+        "black cat",
+        "",
+    ),
+    (
+        "Beautiful landscape with mountains at sunset",
+        "ugly",
+    ),
+    (
+        "portrait of a young woman, cinematic lighting",
+        "low quality",
+    ),
+    (
+        "space rocket launch",
+        "",
+    ),
+    (
+        "colorful abstract shapes",
+        "unrealistic",
+    ),
+]
 
 
 def register_input_log_hook(unet, inputs):
@@ -113,9 +140,15 @@ def generate_calibration_data(pipe, args, calibration_dir):
         CALIBRATION_DATA if not getattr(args, "test", False) else CALIBRATION_DATA[:1]
     )
 
-    for prompt in prompts:
+    for prompt, negative_prompt in prompts:
         gen = torch.manual_seed(args.seed)
-        pipe(prompt=prompt, generator=gen, num_inference_steps=4, guidance_scale=0)
+        pipe(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            generator=gen,
+            num_inference_steps=4,
+            guidance_scale=0,
+        )
         filename = "_".join(prompt.split(" ")) + "_" + str(args.seed) + ".pkl"
         filepath = os.path.join(calibration_dir, filename)
         with open(filepath, "wb") as f:
@@ -256,7 +289,7 @@ def quantize(model, config, calibration_data):
     return quantized_model
 
 
-def sparsegpt_quantize(model, dataloader, sparsity):
+def sparsegpt_pruning(model, dataloader, sparsity):
     """Prune ``model`` weights using SparseGPT via coremltools."""
 
     if sparsity <= 0:
@@ -269,7 +302,7 @@ def sparsegpt_quantize(model, dataloader, sparsity):
             "global_config": {
                 "algorithm": "sparse_gpt",
                 "target_sparsity": sparsity,
-                "weight_dtype": "float32",
+                "weight_dtype": "float16",
             },
             "input_cacher": "default",
             "calibration_nsamples": len(dataloader),
@@ -375,9 +408,11 @@ def convert_quantized_unet(pipe, args):
     reference_unet.to(quant_device)
     _log_device("Reference UNet", reference_unet)
 
-    quant_unet = quantize(reference_unet, config, dataloader)
-    quant_unet.config.use_cache = False
-    quant_unet = sparsegpt_quantize(quant_unet, dataloader, args.sparsegpt_sparsity)
+    quant_unet = reference_unet
+    if args.activation_quantization:
+        quant_unet = quantize(reference_unet, config, dataloader)
+        quant_unet.config.use_cache = False
+    quant_unet = sparsegpt_pruning(quant_unet, dataloader, args.sparsegpt_sparsity)
     # reference_unet and calibration data are no longer needed
     del reference_unet, dataloader
     gc.collect()
@@ -559,9 +594,14 @@ def parser_spec():
         help="Run calibration data generation on a single prompt",
     )
     parser.add_argument(
+        "--activation-quantization",
+        action="store_true",
+        help="Apply W8A8 activation quantization before pruning",
+    )
+    parser.add_argument(
         "--sparsegpt-sparsity",
         type=float,
-        default=0.0,
+        default=0.5,
         help="Proportion of weights to prune using SparseGPT (0 disables)",
     )
     return parser
