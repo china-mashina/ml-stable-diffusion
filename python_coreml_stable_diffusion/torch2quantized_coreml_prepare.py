@@ -19,7 +19,7 @@ from copy import deepcopy
 import coremltools as ct
 import numpy as np
 import torch
-from typing import Iterable
+from typing import Iterable, Optional
 from coremltools.optimize.torch.layerwise_compression import (
     LayerwiseCompressor,
     LayerwiseCompressorConfig,
@@ -95,12 +95,42 @@ def prompt_to_filename(prompt: str, seed: int) -> str:
     """Return a unique filename for the given prompt and seed.
 
     All non alphabetic characters are removed from the prompt text before
-    generating a hash to help avoid collisions.
+    generating a hash to help avoid collisions. If the sanitized text is long,
+    only the first 10 characters are used.
     """
 
     sanitized = re.sub(r"[^A-Za-z]+", "", prompt)
+    sanitized = sanitized[:10]
     digest = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:8]
     return f"{sanitized}_{digest}_{seed}.pkl"
+
+
+def maybe_shorten_prompt(prompt: str, tokenizer, max_length: Optional[int] = None) -> str:
+    """Trim ``prompt`` to fit within the tokenizer's max length.
+
+    If the prompt tokenizes to more than ``max_length`` tokens, progressively
+    shorten it at word boundaries until it fits. Each fallback prefix is logged.
+    """
+
+    if tokenizer is None:
+        return prompt
+
+    limit = max_length or getattr(tokenizer, "model_max_length", 77)
+    tokens = tokenizer(prompt, add_special_tokens=False).input_ids
+    if len(tokens) <= limit:
+        return prompt
+
+    words = prompt.split()
+    while words:
+        candidate = " ".join(words)
+        if len(tokenizer(candidate, add_special_tokens=False).input_ids) <= limit:
+            logger.info(f'Falling back to prefix "{candidate}"')
+            return candidate
+        words.pop()
+
+    candidate = tokenizer.decode(tokens[:limit], skip_special_tokens=True)
+    logger.info(f'Falling back to prefix "{candidate}"')
+    return candidate
 
 
 def register_input_log_hook(unet, inputs):
@@ -155,6 +185,13 @@ def generate_calibration_data(pipe, args, calibration_dir):
 
     for prompt, negative_prompt in prompts:
         gen = torch.manual_seed(args.seed)
+        if hasattr(pipe, "tokenizer"):
+            prompt = maybe_shorten_prompt(prompt, pipe.tokenizer)
+            negative_prompt = maybe_shorten_prompt(negative_prompt, pipe.tokenizer)
+        if hasattr(pipe, "tokenizer_2"):
+            prompt = maybe_shorten_prompt(prompt, pipe.tokenizer_2)
+            negative_prompt = maybe_shorten_prompt(negative_prompt, pipe.tokenizer_2)
+
         pipe(
             prompt=prompt,
             negative_prompt=negative_prompt,
