@@ -10,6 +10,8 @@ import gc
 import logging
 import os
 import pickle
+import re
+import hashlib
 import operator
 from collections import OrderedDict
 from copy import deepcopy
@@ -89,6 +91,18 @@ with open("negative_prompts.txt", "r", encoding="utf-8") as f:
 CALIBRATION_DATA = list(zip(prompts, negative_prompts))
 
 
+def prompt_to_filename(prompt: str, seed: int) -> str:
+    """Return a unique filename for the given prompt and seed.
+
+    All non alphabetic characters are removed from the prompt text before
+    generating a hash to help avoid collisions.
+    """
+
+    sanitized = re.sub(r"[^A-Za-z]+", "", prompt)
+    digest = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:8]
+    return f"{sanitized}_{digest}_{seed}.pkl"
+
+
 def register_input_log_hook(unet, inputs):
     """Register forward pre hook to save model inputs.
 
@@ -148,7 +162,7 @@ def generate_calibration_data(pipe, args, calibration_dir):
             num_inference_steps=4,
             guidance_scale=0,
         )
-        filename = "_".join(prompt.split(" ")) + "_" + str(args.seed) + ".pkl"
+        filename = prompt_to_filename(prompt, args.seed)
         filepath = os.path.join(calibration_dir, filename)
         with open(filepath, "wb") as f:
             pickle.dump(unet_inputs, f)
