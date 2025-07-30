@@ -52,8 +52,20 @@ def _log_device(name, obj):
 
 torch.set_grad_enabled(False)
 
-with open('prompts.txt', 'r', encoding='utf-8') as f:
+with open("prompts.txt", "r", encoding="utf-8") as f:
     CALIBRATION_DATA = [line.strip() for line in f.readlines()]
+
+# Load negative prompts that mirror the calibration prompts.  Each line in
+# ``negative_prompts.txt`` corresponds to the prompt on the same line in
+# ``prompts.txt`` and is used during latent generation when running the
+# pipeline.
+with open("negative_prompts.txt", "r", encoding="utf-8") as f:
+    NEGATIVE_CALIBRATION_DATA = [line.strip() for line in f.readlines()]
+
+if len(NEGATIVE_CALIBRATION_DATA) != len(CALIBRATION_DATA):
+    raise ValueError(
+        "negative_prompts.txt must contain the same number of lines as prompts.txt"
+    )
 
 
 def register_input_log_hook(unet, inputs):
@@ -105,10 +117,19 @@ def generate_calibration_data(pipe, args, calibration_dir):
     prompts = (
         CALIBRATION_DATA if not getattr(args, "test", False) else CALIBRATION_DATA[:1]
     )
+    negative_prompts = (
+        NEGATIVE_CALIBRATION_DATA if not getattr(args, "test", False) else NEGATIVE_CALIBRATION_DATA[:1]
+    )
 
-    for prompt in prompts:
+    for prompt, negative_prompt in zip(prompts, negative_prompts):
         gen = torch.manual_seed(args.seed)
-        pipe(prompt=prompt, generator=gen, num_inference_steps=4, guidance_scale=0)
+        pipe(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            generator=gen,
+            num_inference_steps=4,
+            guidance_scale=0,
+        )
         filename = "_".join(prompt.split(" ")) + "_" + str(args.seed) + ".pkl"
         filepath = os.path.join(calibration_dir, filename)
         with open(filepath, "wb") as f:
