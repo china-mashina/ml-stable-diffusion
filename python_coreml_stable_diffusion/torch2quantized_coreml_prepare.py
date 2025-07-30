@@ -10,6 +10,8 @@ import gc
 import logging
 import os
 import pickle
+import re
+import hashlib
 import operator
 from collections import OrderedDict
 from copy import deepcopy
@@ -17,6 +19,11 @@ from copy import deepcopy
 import coremltools as ct
 import numpy as np
 import torch
+from typing import Iterable
+from coremltools.optimize.torch.layerwise_compression import (
+    LayerwiseCompressor,
+    LayerwiseCompressorConfig,
+)
 from coremltools.optimize.torch.quantization import (
     LinearQuantizer,
     LinearQuantizerConfig,
@@ -36,6 +43,26 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
+class TensorTuple(list):
+    """Container for UNet inputs compatible with ``LayerwiseCompressor``."""
+
+    def to(self, device: str):
+        return TensorTuple(
+            [x.to(device) if torch.is_tensor(x) else x for x in self]
+        )
+
+
+class UNetWrapper(torch.nn.Module):
+    """Wrap UNet so ``LayerwiseCompressor`` can call it with a single argument."""
+
+    def __init__(self, unet: torch.nn.Module):
+        super().__init__()
+        self.unet = unet
+
+    def forward(self, batch: Iterable[torch.Tensor]):
+        return self.unet(*batch)
+
+
 def _log_device(name, obj):
     """Utility to log the device of an object if available."""
     dev = None
@@ -52,8 +79,28 @@ def _log_device(name, obj):
 
 torch.set_grad_enabled(False)
 
-with open('prompts.txt', 'r', encoding='utf-8') as f:
-    CALIBRATION_DATA = [line.strip() for line in f.readlines()]
+# Load prompts and optional negative prompts used to generate calibration data.
+with open("prompts.txt", "r", encoding="utf-8") as f:
+    prompts = [line.strip() for line in f.readlines()]
+
+with open("negative_prompts.txt", "r", encoding="utf-8") as f:
+    negative_prompts = [line.strip() for line in f.readlines()]
+
+# Pair each prompt with the corresponding negative prompt. If a negative prompt
+# line is empty, an empty string will be used during generation.
+CALIBRATION_DATA = list(zip(prompts, negative_prompts))
+
+
+def prompt_to_filename(prompt: str, seed: int) -> str:
+    """Return a unique filename for the given prompt and seed.
+
+    All non alphabetic characters are removed from the prompt text before
+    generating a hash to help avoid collisions.
+    """
+
+    sanitized = re.sub(r"[^A-Za-z]+", "", prompt)
+    digest = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:8]
+    return f"{sanitized}_{digest}_{seed}.pkl"
 
 
 def register_input_log_hook(unet, inputs):
@@ -106,10 +153,16 @@ def generate_calibration_data(pipe, args, calibration_dir):
         CALIBRATION_DATA if not getattr(args, "test", False) else CALIBRATION_DATA[:1]
     )
 
-    for prompt in prompts:
+    for prompt, negative_prompt in prompts:
         gen = torch.manual_seed(args.seed)
-        pipe(prompt=prompt, generator=gen, num_inference_steps=4, guidance_scale=0)
-        filename = "_".join(prompt.split(" ")) + "_" + str(args.seed) + ".pkl"
+        pipe(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            generator=gen,
+            num_inference_steps=4,
+            guidance_scale=0,
+        )
+        filename = prompt_to_filename(prompt, args.seed)
         filepath = os.path.join(calibration_dir, filename)
         with open(filepath, "wb") as f:
             pickle.dump(unet_inputs, f)
@@ -132,7 +185,9 @@ def unet_data_loader(data_dir, device="cpu", calibration_nsamples=None):
                         unet_data = pickle.load(data)
                         for inp in unet_data:
                             dataloader.append(
-                                [x.to(torch.float32).to(device) for x in inp]
+                                TensorTuple([
+                                    x.to(torch.float32).to(device) for x in inp
+                                ])
                             )
                             for i, t in enumerate(dataloader[-1]):
                                 _log_device(
@@ -249,6 +304,46 @@ def quantize(model, config, calibration_data):
     return quantized_model
 
 
+def sparsegpt_pruning(model, dataloader, sparsity):
+    """Prune ``model`` weights using SparseGPT via coremltools.
+
+    The dataloader must contain the same samples used during activation
+    quantization. Each sample is converted with ``_to_coreml_unet_inputs`` so
+    the compressor receives inputs in the exact format expected by the model.
+    """
+
+    if sparsity <= 0:
+        return model
+
+    logger.info("Pruning model with SparseGPT")
+
+    config = LayerwiseCompressorConfig.from_dict(
+        {
+            "global_config": {
+                "algorithm": "sparse_gpt",
+                "target_sparsity": sparsity,
+                "weight_dtype": "float16",
+            },
+            "input_cacher": "default",
+            "calibration_nsamples": len(dataloader),
+        }
+    )
+
+    wrapped_model = UNetWrapper(model)
+    compressor = LayerwiseCompressor(wrapped_model, config)
+
+    # ``compress`` expects an iterable of inputs that can be directly passed to
+    # the model. Convert calibration samples to ``TensorTuple`` so they can be
+    # moved to the requested device and unpacked by ``UNetWrapper``.
+    calibration_loader = [
+        TensorTuple(_to_coreml_unet_inputs(*sample)) for sample in dataloader
+    ]
+
+    device = next(model.parameters()).device
+    compressor.compress(calibration_loader, device=str(device), inplace=True)
+    return model
+
+
 def _prepare_calibration(pipe, args, calib_dir):
     """Generate calibration data if needed and return dataloader."""
     if args.generate_calibration_data or not os.path.exists(calib_dir):
@@ -306,6 +401,7 @@ def convert_quantized_unet(pipe, args):
     ).eval()
     reference_unet.load_state_dict(pipe.unet.state_dict())
     reference_unet.to("cpu")
+    reference_unet.config.use_cache = False
 
     if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
         text_token_sequence_length = pipe.text_encoder.config.max_position_embeddings
@@ -340,7 +436,11 @@ def convert_quantized_unet(pipe, args):
     reference_unet.to(quant_device)
     _log_device("Reference UNet", reference_unet)
 
-    quant_unet = quantize(reference_unet, config, dataloader)
+    quant_unet = reference_unet
+    if args.activation_quantization:
+        quant_unet = quantize(reference_unet, config, dataloader)
+        quant_unet.config.use_cache = False
+    quant_unet = sparsegpt_pruning(quant_unet, dataloader, args.sparsegpt_sparsity)
     # reference_unet and calibration data are no longer needed
     del reference_unet, dataloader
     gc.collect()
@@ -520,6 +620,17 @@ def parser_spec():
         "--test",
         action="store_true",
         help="Run calibration data generation on a single prompt",
+    )
+    parser.add_argument(
+        "--activation-quantization",
+        action="store_true",
+        help="Apply W8A8 activation quantization before pruning",
+    )
+    parser.add_argument(
+        "--sparsegpt-sparsity",
+        type=float,
+        default=0.5,
+        help="Proportion of weights to prune using SparseGPT (0 disables)",
     )
     return parser
 
