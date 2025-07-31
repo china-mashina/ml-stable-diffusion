@@ -550,6 +550,7 @@ This generally takes 15-20 minutes on an M1 MacBook Pro. Upon successful executi
 - `--quantize-nbits`: Quantizes the weights of unet and text_encoder models down to 2, 4, 6 or 8 bits using a globally optimal k-means clustering algorithm. By default all models are weight-quantized to 16 bits even if this argument is not specified. Please refer to [this section](#compression-6-bits-and-higher for details and further guidance on weight compression.
 
 - `--chunk-unet`: Splits the Unet model in two approximately equal chunks (each with less than 1GB of weights) for mobile-friendly deployment. This is **required** for Neural Engine deployment on iOS and iPadOS if weights are not quantized to 6-bits or less (`--quantize-nbits {2,4,6}`). This is not required for macOS. Swift CLI is able to consume both the chunked and regular versions of the Unet model but prioritizes the former. Note that chunked unet is not compatible with the Python pipeline because Python pipeline is intended for macOS only.
+  The split now estimates compression so the resulting `.mlpackage` files should be close in size even when the model is quantized.
 
 - `--attention-implementation`: Defaults to `SPLIT_EINSUM` which is the implementation described in [Deploying Transformers on the Apple Neural Engine](https://machinelearning.apple.com/research/neural-engine-transformers). `--attention-implementation SPLIT_EINSUM_V2` yields 10-30% improvement for mobile devices, still targeting the Neural Engine. `--attention-implementation ORIGINAL` will switch to an alternative implementation that should be used for CPU or GPU deployment on some Mac devices. Please refer to the [Performance Benchmark](#performance-benchmark) section for further guidance.
 
@@ -648,6 +649,7 @@ Optionally, for ControlNet:
   - Other models you converted
 
 Note that the chunked version of Unet is checked for first. Only if it is not present will the full `Unet.mlmodelc` be loaded. Chunking is required for iOS and iPadOS and not necessary for macOS.
+The chunking process uses compression estimates so both files should end up similar in size.
 
 </details>
 
