@@ -10,6 +10,7 @@ import gc
 import logging
 import os
 import pickle
+import json
 import operator
 from collections import OrderedDict
 from copy import deepcopy
@@ -17,6 +18,7 @@ from copy import deepcopy
 import coremltools as ct
 import numpy as np
 import torch
+from tqdm import tqdm
 from coremltools.optimize.torch.quantization import (
     LinearQuantizer,
     LinearQuantizerConfig,
@@ -174,6 +176,46 @@ def unet_data_loader(data_dir, device="cpu", calibration_nsamples=None):
     return dataloader
 
 
+def quantize_module_config(module_name):
+    """Return config that quantizes only the specified module."""
+
+    config = LinearQuantizerConfig(
+        global_config=ModuleLinearQuantizerConfig(
+            milestones=[0, 1000, 1000, 0],
+            weight_dtype=torch.float32,
+            activation_dtype=torch.float32,
+        ),
+        module_name_configs={
+            module_name: ModuleLinearQuantizerConfig(
+                quantization_scheme="symmetric",
+                milestones=[0, 1000, 1000, 0],
+            )
+        },
+        module_type_configs={
+            torch.cat: None,
+            torch.nn.GroupNorm: None,
+            torch.nn.SiLU: None,
+            torch.nn.functional.gelu: None,
+            operator.add: None,
+        },
+    )
+    return config
+
+
+def get_quantizable_modules(unet):
+    """Return list of leaf modules that can be quantized."""
+
+    quantizable_modules = []
+    for name, module in unet.named_modules():
+        if len(list(module.children())) > 0:
+            continue
+        if isinstance(module, torch.nn.Conv2d):
+            quantizable_modules.append(("conv", name))
+        if isinstance(module, Einsum):
+            quantizable_modules.append(("einsum", name))
+    return quantizable_modules
+
+
 def quantize_cumulative_config(skip_conv_layers, skip_einsum_layers):
     """Return LinearQuantizerConfig for W8A8 quantization."""
 
@@ -284,6 +326,88 @@ def _prepare_calibration(pipe, args, calib_dir):
         for i, t in enumerate(dataloader[0]):
             _log_device(f"Calibration sample[0] tensor {i}", t)
     return dataloader
+
+
+def register_input_preprocessing_hook(pipe):
+    """Register hook to adapt pipeline inputs for the quantized UNet."""
+
+    def hook(_, args, kwargs):
+        sample = args[0]
+        timestep = args[1]
+        encoder_hidden_states = kwargs["encoder_hidden_states"]
+        time_ids = kwargs.get("time_ids")
+        text_embeds = kwargs.get("text_embeds")
+        if "added_cond_kwargs" in kwargs:
+            added = kwargs["added_cond_kwargs"]
+            if isinstance(added, dict):
+                time_ids = time_ids or added.get("time_ids")
+                text_embeds = text_embeds or added.get("text_embeds")
+        modified = _to_coreml_unet_inputs(
+            sample, timestep, encoder_hidden_states, time_ids, text_embeds
+        )
+        return (modified, {})
+
+    return pipe.unet.register_forward_pre_hook(hook, with_kwargs=True)
+
+
+def prepare_pipe(pipe, unet):
+    """Create a new pipeline with ``unet`` as the noise predictor."""
+
+    new_pipe = deepcopy(pipe)
+    unet.to(new_pipe.unet.device)
+    new_pipe.unet = unet
+    pre_hook_handle = register_input_preprocessing_hook(new_pipe)
+    return new_pipe, pre_hook_handle
+
+
+def run_pipe(pipe, prompts, negative_prompts, seed):
+    gen = torch.manual_seed(seed)
+    kwargs = dict(prompt=prompts, output_type="latent", generator=gen)
+    if negative_prompts is not None:
+        kwargs["negative_prompt"] = negative_prompts
+        kwargs["guidance_scale"] = 0
+    return np.array([latent.cpu().numpy() for latent in pipe(**kwargs).images])
+
+
+def layerwise_sensitivity(pipe, args):
+    """Compute layer-wise PSNR by quantizing one layer at a time."""
+
+    calib_dir = os.path.join(args.o, "calibration_data")
+    dataloader = _prepare_calibration(pipe, args, calib_dir)
+
+    prompts = CALIBRATION_DATA if not getattr(args, "test", False) else CALIBRATION_DATA[:1]
+    negative_prompts = (
+        NEGATIVE_CALIBRATION_DATA
+        if not getattr(args, "test", False)
+        else NEGATIVE_CALIBRATION_DATA[:1]
+    )
+
+    logger.info("Generating reference outputs")
+    ref_out = run_pipe(pipe, prompts, negative_prompts, args.seed)
+
+    quantizable_modules = get_quantizable_modules(pipe.unet)
+    results = {"conv": {}, "einsum": {}, "model_version": args.model_version}
+
+    for module_type, module_name in tqdm(quantizable_modules):
+        logger.info(f"Quantizing UNet layer: {module_name}")
+        config = quantize_module_config(module_name)
+        quantized_unet = quantize(deepcopy(pipe.unet), config, dataloader)
+        q_pipe, _ = prepare_pipe(pipe, quantized_unet)
+        test_out = run_pipe(q_pipe, prompts, negative_prompts, args.seed)
+        psnr = [float(f"{torch2coreml.compute_psnr(r, t):.1f}") for r, t in zip(ref_out, test_out)]
+        avg_psnr = sum(psnr) / len(psnr)
+        logger.info(f"AVG PSNR: {avg_psnr}")
+        results[module_type][module_name] = avg_psnr
+        del quantized_unet, q_pipe
+        gc.collect()
+
+    recipe_json_path = os.path.join(
+        args.o, f"{args.model_version.replace('/', '_')}_quantization_recipe.json"
+    )
+    with open(recipe_json_path, "w") as f:
+        json.dump(results, f, indent=2)
+
+    logger.info(f"Layer-wise sensitivity results saved to {recipe_json_path}")
 
 
 def convert_quantized_unet(pipe, args):
@@ -493,7 +617,9 @@ def main(args):
 
     # Load diffusers pipeline as in torch2coreml
     pipe = torch2coreml.get_pipeline(args)
-    if torch.cuda.is_available():
+    if args.layerwise_sensitivity:
+        pipe.to(device="cpu", dtype=torch.float32)
+    elif torch.cuda.is_available():
         pipe.to(device="cuda", dtype=torch.float32)
     elif torch.backends.mps.is_available():
         pipe.to(device="mps", dtype=torch.float32)
@@ -511,7 +637,10 @@ def main(args):
     unet_mod.ATTENTION_IMPLEMENTATION_IN_EFFECT = unet_mod.AttentionImplementations[
         args.attention_implementation
     ]
-    
+
+    if args.layerwise_sensitivity:
+        layerwise_sensitivity(pipe, args)
+
     if args.convert_unet:
         convert_quantized_unet(pipe, args)
         del pipe
@@ -541,6 +670,11 @@ def parser_spec():
         "--test",
         action="store_true",
         help="Run calibration data generation on a single prompt",
+    )
+    parser.add_argument(
+        "--layerwise-sensitivity",
+        action="store_true",
+        help="Compute compression sensitivity per-layer, by quantizing one layer at a time",
     )
     return parser
 
