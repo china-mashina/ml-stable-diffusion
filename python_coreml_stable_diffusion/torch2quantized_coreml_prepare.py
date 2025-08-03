@@ -391,6 +391,15 @@ def register_input_preprocessing_hook(pipe):
     return pipe.unet.register_forward_pre_hook(hook, with_kwargs=True)
 
 
+def _patch_add_embedding_linear_attrs(unet):
+    """Provide Linear-like attributes for Conv-based timestep embeddings."""
+
+    if hasattr(unet, "add_embedding"):
+        lin1 = getattr(unet.add_embedding, "linear_1", None)
+        if isinstance(lin1, torch.nn.Conv2d) and not hasattr(lin1, "in_features"):
+            lin1.in_features = lin1.in_channels
+
+
 def prepare_pipe(pipe, unet):
     """Create a new pipeline with ``unet`` as the noise predictor."""
 
@@ -425,6 +434,7 @@ def layerwise_sensitivity(pipe, args):
         support_controlnet=args.unet_support_controlnet, **pipe.unet.config
     ).eval()
     reference_unet.load_state_dict(pipe.unet.state_dict())
+    _patch_add_embedding_linear_attrs(reference_unet)
     reference_unet.to("cpu")
     pipe, _ = prepare_pipe(pipe, reference_unet)
 
@@ -445,6 +455,7 @@ def layerwise_sensitivity(pipe, args):
         logger.info(f"Quantizing UNet layer: {module_name}")
         config = quantize_module_config(module_name)
         quantized_unet = quantize(deepcopy(pipe.unet), config, dataloader)
+        _patch_add_embedding_linear_attrs(quantized_unet)
         q_pipe, handle = prepare_pipe(pipe, quantized_unet)
         test_out = run_pipe(q_pipe, prompts, negative_prompts, args.seed)
         psnr = [float(f"{torch2coreml.compute_psnr(r, t):.1f}") for r, t in zip(ref_out, test_out)]
