@@ -438,7 +438,8 @@ def layerwise_sensitivity(pipe, args):
     ).eval()
     reference_unet.load_state_dict(pipe.unet.state_dict())
     _patch_add_embedding_linear_attrs(reference_unet)
-    reference_unet.to("cpu")
+    # ``prepare_pipe`` will move ``reference_unet`` to the pipeline's device, so we
+    # keep it on CPU here to avoid an extra transfer when CUDA is available.
     pipe, _ = prepare_pipe(pipe, reference_unet)
 
     prompts = CALIBRATION_DATA if not getattr(args, "test", False) else CALIBRATION_DATA[:1]
@@ -457,7 +458,10 @@ def layerwise_sensitivity(pipe, args):
     for module_type, module_name in tqdm(quantizable_modules):
         logger.info(f"Quantizing UNet layer: {module_name}")
         config = quantize_module_config(module_name)
-        quantized_unet = quantize(deepcopy(pipe.unet), config, dataloader)
+        # Calibration samples are stored on CPU, so quantize a CPU copy of the
+        # module and let ``prepare_pipe`` move it back to the pipeline's device
+        # for evaluation.
+        quantized_unet = quantize(deepcopy(pipe.unet).to("cpu"), config, dataloader)
         _patch_add_embedding_linear_attrs(quantized_unet)
         q_pipe, handle = prepare_pipe(pipe, quantized_unet)
         test_out = run_pipe(q_pipe, prompts, negative_prompts, args.seed)
@@ -712,11 +716,10 @@ def chunk_unet(args):
 def main(args):
     os.makedirs(args.o, exist_ok=True)
 
-    # Load diffusers pipeline as in torch2coreml
+    # Load diffusers pipeline as in ``torch2coreml``.  Run the pipeline on CUDA
+    # when available to speed up layer-wise sensitivity sweeps.
     pipe = torch2coreml.get_pipeline(args)
-    if args.layerwise_sensitivity:
-        pipe.to(device="cpu", dtype=torch.float32)
-    elif torch.cuda.is_available():
+    if torch.cuda.is_available():
         pipe.to(device="cuda", dtype=torch.float32)
     elif torch.backends.mps.is_available():
         pipe.to(device="mps", dtype=torch.float32)
