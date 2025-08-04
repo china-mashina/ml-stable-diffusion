@@ -396,8 +396,11 @@ def _patch_add_embedding_linear_attrs(unet):
 
     if hasattr(unet, "add_embedding"):
         lin1 = getattr(unet.add_embedding, "linear_1", None)
-        if isinstance(lin1, torch.nn.Conv2d) and not hasattr(lin1, "in_features"):
-            lin1.in_features = lin1.in_channels
+        if lin1 is not None and not hasattr(lin1, "in_features"):
+            if hasattr(lin1, "in_channels"):
+                lin1.in_features = lin1.in_channels
+            elif hasattr(lin1, "conv") and hasattr(lin1.conv, "in_channels"):
+                lin1.in_features = lin1.conv.in_channels
 
 
 def prepare_pipe(pipe, unet):
