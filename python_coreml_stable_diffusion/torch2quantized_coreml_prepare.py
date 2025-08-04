@@ -427,6 +427,21 @@ def _move_tensor_attrs(module, device):
         _move_tensor_attrs(child, device)
 
 
+def _ensure_module_dtype(module):
+    """Ensure ``module`` exposes a ``dtype`` attribute.
+
+    ``diffusers.DiffusionPipeline`` expects each component to define ``dtype``
+    when moving the pipeline across devices. Quantized ``GraphModule`` instances
+    lack this attribute, so we derive it from the first parameter if necessary.
+    """
+
+    if not hasattr(module, "dtype"):
+        try:
+            module.dtype = next(module.parameters()).dtype
+        except StopIteration:
+            module.dtype = torch.get_default_dtype()
+
+
 def prepare_pipe(pipe, unet, device=None):
     """Swap ``pipe.unet`` with ``unet`` and register preprocessing hook.
 
@@ -457,6 +472,7 @@ def prepare_pipe(pipe, unet, device=None):
         torch.cuda.empty_cache()
 
     unet.to(target_device)
+    _ensure_module_dtype(unet)
     pipe.unet = unet
     # Ensure the rest of the pipeline is aware of the new execution device.
     pipe.to(target_device)
