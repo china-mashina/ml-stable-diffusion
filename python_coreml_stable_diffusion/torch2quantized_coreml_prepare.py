@@ -427,23 +427,40 @@ def _move_tensor_attrs(module, device):
         _move_tensor_attrs(child, device)
 
 
-def prepare_pipe(pipe, unet):
+def prepare_pipe(pipe, unet, device=None):
     """Swap ``pipe.unet`` with ``unet`` and register preprocessing hook.
 
-    Returns the previous UNet and the hook handle so the caller can restore the
-    original state after running inference.
+    Parameters
+    ----------
+    pipe: DiffusionPipeline
+        Pipeline whose UNet will be replaced.
+    unet: torch.nn.Module
+        Replacement UNet.
+    device: str or torch.device, optional
+        Device on which the pipeline should run.  If ``None``, the device of
+        the current ``pipe.unet`` is used.
+
+    Returns
+    -------
+    Tuple[torch.nn.Module, RemovableHandle]
+        The previous UNet (now moved to CPU) and the forward-pre-hook handle so
+        callers can restore the original state after running inference.
     """
 
     prev_unet = pipe.unet
-    device = next(prev_unet.parameters()).device
+    target_device = device or next(prev_unet.parameters()).device
+
     # Move the previous UNet off the device before loading the new one to avoid
     # temporarily holding two full models in GPU memory.
     prev_unet.to("cpu")
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    unet.to(device)
+    unet.to(target_device)
     pipe.unet = unet
+    # Ensure the rest of the pipeline is aware of the new execution device.
+    pipe.to(target_device)
+
     pre_hook_handle = register_input_preprocessing_hook(pipe)
     return prev_unet, pre_hook_handle
 
@@ -511,7 +528,7 @@ def layerwise_sensitivity(pipe, args):
 
         quantized_unet.to(device)
         _move_tensor_attrs(quantized_unet, device)
-        prev_unet, handle = prepare_pipe(pipe, quantized_unet)
+        prev_unet, handle = prepare_pipe(pipe, quantized_unet, device)
         test_out = run_pipe(pipe, prompts, negative_prompts, args.seed)
         psnr = [float(f"{torch2coreml.compute_psnr(r, t):.1f}") for r, t in zip(ref_out, test_out)]
         avg_psnr = sum(psnr) / len(psnr)
