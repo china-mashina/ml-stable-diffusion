@@ -403,6 +403,24 @@ def _patch_add_embedding_linear_attrs(unet):
                 lin1.in_features = lin1.conv.in_channels
 
 
+def _move_tensor_attrs(module, device):
+    """Move tensor attributes that are not registered buffers to ``device``.
+
+    ``torch.nn.Module.to`` only migrates parameters and registered buffers.
+    Quantized models produced by ``torch.ao`` stash scale and zero-point values
+    as plain attributes, leaving them on the CPU even after ``to(device)`` is
+    called.  This helper walks the module hierarchy and explicitly moves any
+    such tensors so the module can execute on the desired device without
+    device-mismatch errors.
+    """
+
+    for name, attr in vars(module).items():
+        if torch.is_tensor(attr):
+            setattr(module, name, attr.to(device))
+    for child in module.children():
+        _move_tensor_attrs(child, device)
+
+
 def prepare_pipe(pipe, unet):
     """Swap ``pipe.unet`` with ``unet`` and register preprocessing hook.
 
@@ -486,6 +504,7 @@ def layerwise_sensitivity(pipe, args):
         _patch_add_embedding_linear_attrs(quantized_unet)
 
         quantized_unet.to(device)
+        _move_tensor_attrs(quantized_unet, device)
         prev_unet, handle = prepare_pipe(pipe, quantized_unet)
         test_out = run_pipe(pipe, prompts, negative_prompts, args.seed)
         psnr = [float(f"{torch2coreml.compute_psnr(r, t):.1f}") for r, t in zip(ref_out, test_out)]
