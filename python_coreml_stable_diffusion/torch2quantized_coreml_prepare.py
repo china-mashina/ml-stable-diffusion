@@ -92,14 +92,17 @@ CALIBRATION_DATA = list(zip(prompts, negative_prompts))
 
 
 def prompt_to_filename(prompt: str, seed: int) -> str:
-    """Return a unique filename for the given prompt and seed.
+    """Return a unique, sanitized filename for the calibration sample.
 
-    All non alphabetic characters are removed from the prompt text before
-    generating a hash to help avoid collisions. If the sanitized text is long,
-    only the first 10 characters are used.
+    Prompts may contain characters that are illegal in file paths (for example,
+    commas or ``/``).  All non alphabetic symbols are stripped and the remaining
+    text is truncated so filenames stay short even when prompts are long.  A
+    short hash of the full prompt and the seed keep filenames unique.
     """
 
     sanitized = re.sub(r"[^A-Za-z]+", "", prompt)
+    if not sanitized:
+        sanitized = "prompt"
     sanitized = sanitized[:10]
     digest = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:8]
     return f"{sanitized}_{digest}_{seed}.pkl"
@@ -208,41 +211,64 @@ def generate_calibration_data(pipe, args, calibration_dir):
     handle.remove()
 
 
-def unet_data_loader(data_dir, device="cpu", calibration_nsamples=None):
-    """Load serialized UNet inputs from calibration directory."""
+class UNetCalibrationDataset:
+    """Iterable that loads serialized UNet inputs on demand."""
 
-    dataloader = []
-    skip_load = False
-    for file in sorted(os.listdir(data_dir)):
-        if file.endswith(".pkl"):
-            filepath = os.path.join(data_dir, file)
-            with open(filepath, "rb") as data:
+    def __init__(self, data_dir, device="cpu", limit=None):
+        self.device = device
+        self.limit = limit
+        self.files = [
+            os.path.join(data_dir, f)
+            for f in sorted(os.listdir(data_dir))
+            if f.endswith(".pkl")
+        ]
+        self._length = None
+
+    def __iter__(self):
+        count = 0
+        for file in self.files:
+            with open(file, "rb") as data:
                 try:
-                    while not skip_load:
+                    while True:
                         unet_data = pickle.load(data)
                         for inp in unet_data:
-                            dataloader.append(
-                                TensorTuple([
-                                    x.to(torch.float32).to(device) for x in inp
-                                ])
+                            sample = TensorTuple(
+                                [x.to(torch.float32).to(self.device) for x in inp]
                             )
-                            for i, t in enumerate(dataloader[-1]):
-                                _log_device(
-                                    f"Loaded tensor device {len(dataloader)-1}_{i}", t
-                                )
-                            if (
-                                calibration_nsamples
-                                and len(dataloader) >= calibration_nsamples
-                            ):
-                                skip_load = True
-                                break
+                            for i, t in enumerate(sample):
+                                _log_device(f"Loaded tensor device {count}_{i}", t)
+                            yield sample
+                            count += 1
+                            if self.limit and count >= self.limit:
+                                return
                 except EOFError:
                     pass
-        if skip_load:
-            break
 
-    logger.info(f"Total calibration samples: {len(dataloader)}")
-    return dataloader
+    def __len__(self):
+        if self._length is None:
+            total = 0
+            for file in self.files:
+                with open(file, "rb") as data:
+                    try:
+                        while True:
+                            unet_data = pickle.load(data)
+                            total += len(unet_data)
+                            if self.limit and total >= self.limit:
+                                self._length = self.limit
+                                return self._length
+                    except EOFError:
+                        pass
+            self._length = total
+        return self._length
+
+    def first(self):
+        return next(iter(self), None)
+
+
+def unet_data_loader(data_dir, device="cpu", calibration_nsamples=None):
+    dataset = UNetCalibrationDataset(data_dir, device, calibration_nsamples)
+    logger.info(f"Total calibration samples: {len(dataset)}")
+    return dataset
 
 
 def quantize_cumulative_config(skip_conv_layers, skip_einsum_layers):
@@ -317,7 +343,8 @@ def quantize(model, config, calibration_data):
     config.non_traceable_module_names = non_traceable
     config.preserved_attributes = ["config", "device"]
 
-    sample_input = _to_coreml_unet_inputs(*calibration_data[0])
+    sample = calibration_data.first()
+    sample_input = _to_coreml_unet_inputs(*sample)
     for i, t in enumerate(sample_input):
         _log_device(f"Sample input tensor {i}", t)
     quantizer = LinearQuantizer(model, config)
@@ -369,15 +396,12 @@ def sparsegpt_pruning(model, dataloader, sparsity):
     wrapped_model = UNetWrapper(model)
     compressor = LayerwiseCompressor(wrapped_model, config)
 
-    # ``compress`` expects an iterable of inputs that can be directly passed to
-    # the model. Convert calibration samples to ``TensorTuple`` so they can be
-    # moved to the requested device and unpacked by ``UNetWrapper``.
-    calibration_loader = [
-        TensorTuple(_to_coreml_unet_inputs(*sample)) for sample in dataloader
-    ]
+    def calibration_loader():
+        for sample in dataloader:
+            yield TensorTuple(_to_coreml_unet_inputs(*sample))
 
     device = next(model.parameters()).device
-    compressor.compress(calibration_loader, device=str(device), inplace=True)
+    compressor.compress(calibration_loader(), device=str(device), inplace=True)
     return model
 
 
@@ -391,8 +415,9 @@ def _prepare_calibration(pipe, args, calib_dir):
     # preparation.
     device = "cpu"
     dataloader = unet_data_loader(calib_dir, device, args.calibration_nsamples)
-    if dataloader:
-        for i, t in enumerate(dataloader[0]):
+    sample = dataloader.first()
+    if sample is not None:
+        for i, t in enumerate(sample):
             _log_device(f"Calibration sample[0] tensor {i}", t)
     return dataloader
 
