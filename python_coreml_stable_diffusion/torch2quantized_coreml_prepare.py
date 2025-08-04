@@ -536,7 +536,27 @@ def layerwise_sensitivity(pipe, args):
     quantizable_modules = get_quantizable_modules(pipe.unet)
     results = {"conv": {}, "einsum": {}, "model_version": args.model_version}
 
+    layerwise_dir = os.path.join(
+        args.o, f"{args.model_version.replace('/', '_')}_layerwise"
+    )
+    os.makedirs(layerwise_dir, exist_ok=True)
+
     for module_type, module_name in tqdm(quantizable_modules):
+        module_dir = os.path.join(layerwise_dir, module_type)
+        os.makedirs(module_dir, exist_ok=True)
+        file_stem = module_name.replace(".", "_")
+        file_path = os.path.join(module_dir, f"{file_stem}.json")
+
+        if os.path.exists(file_path):
+            with open(file_path, "r") as f:
+                data = json.load(f)
+            psnr = data.get("psnr") if isinstance(data, dict) else float(data)
+            results[module_type][module_name] = psnr
+            logger.info(
+                f"Loaded existing layer-wise result for {module_name}: PSNR {psnr}"
+            )
+            continue
+
         logger.info(f"Quantizing UNet layer: {module_name}")
         config = quantize_module_config(module_name)
         quantized_unet = quantize(deepcopy(pipe.unet), config, dataloader)
@@ -546,10 +566,17 @@ def layerwise_sensitivity(pipe, args):
         _move_tensor_attrs(quantized_unet, device)
         prev_unet, handle = prepare_pipe(pipe, quantized_unet, device)
         test_out = run_pipe(pipe, prompts, negative_prompts, args.seed)
-        psnr = [float(f"{torch2coreml.compute_psnr(r, t):.1f}") for r, t in zip(ref_out, test_out)]
+        psnr = [
+            float(f"{torch2coreml.compute_psnr(r, t):.1f}")
+            for r, t in zip(ref_out, test_out)
+        ]
         avg_psnr = sum(psnr) / len(psnr)
         logger.info(f"AVG PSNR: {avg_psnr}")
         results[module_type][module_name] = avg_psnr
+
+        with open(file_path, "w") as f:
+            json.dump({"name": module_name, "psnr": avg_psnr}, f)
+
         handle.remove()
         pipe.unet = prev_unet
         pipe.unet.to("cpu")
@@ -564,7 +591,9 @@ def layerwise_sensitivity(pipe, args):
     with open(recipe_json_path, "w") as f:
         json.dump(results, f, indent=2)
 
-    logger.info(f"Layer-wise sensitivity results saved to {recipe_json_path}")
+    logger.info(
+        f"Layer-wise sensitivity results saved to {layerwise_dir} and {recipe_json_path}"
+    )
 
 
 def convert_quantized_unet(pipe, args):
@@ -632,12 +661,34 @@ def convert_quantized_unet(pipe, args):
     gc.collect()
 
     # Quantization recipe from layerwise sensitivity
+    layerwise_dir = os.path.join(
+        args.o, f"{args.model_version.replace('/', '_')}_layerwise"
+    )
+    results = None
+    if os.path.isdir(layerwise_dir):
+        tmp = {"conv": {}, "einsum": {}}
+        for module_type in ("conv", "einsum"):
+            t_dir = os.path.join(layerwise_dir, module_type)
+            if os.path.isdir(t_dir):
+                for fname in os.listdir(t_dir):
+                    if fname.endswith(".json"):
+                        with open(os.path.join(t_dir, fname), "r") as f:
+                            data = json.load(f)
+                        name = data.get("name") or fname[:-5].replace("_", ".")
+                        psnr = data.get("psnr")
+                        if psnr is not None:
+                            tmp[module_type][name] = psnr
+        if tmp["conv"] or tmp["einsum"]:
+            results = tmp
+
     recipe_json_path = os.path.join(
         args.o, f"{args.model_version.replace('/', '_')}_quantization_recipe.json"
     )
-    if os.path.exists(recipe_json_path):
+    if results is None and os.path.exists(recipe_json_path):
         with open(recipe_json_path, "r") as f:
             results = json.load(f)
+
+    if results is not None:
         skipped_conv = {
             layer for layer, psnr in results["conv"].items() if psnr < args.conv_psnr
         }
