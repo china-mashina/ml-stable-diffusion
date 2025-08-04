@@ -123,7 +123,11 @@ def generate_calibration_data(pipe, args, calibration_dir):
         NEGATIVE_CALIBRATION_DATA if not getattr(args, "test", False) else NEGATIVE_CALIBRATION_DATA[:1]
     )
 
-    for prompt, negative_prompt in zip(prompts, negative_prompts):
+    import re
+
+    for idx, (prompt, negative_prompt) in enumerate(
+        zip(prompts, negative_prompts)
+    ):
         gen = torch.manual_seed(args.seed)
         pipe(
             prompt=prompt,
@@ -132,7 +136,9 @@ def generate_calibration_data(pipe, args, calibration_dir):
             num_inference_steps=4,
             guidance_scale=0,
         )
-        filename = "_".join(prompt.split(" ")) + "_" + str(args.seed) + ".pkl"
+        safe_prompt = re.sub(r"[^\w\- ]", "", prompt)
+        safe_prompt = "_".join(safe_prompt.split())[:50]
+        filename = f"{idx:04d}_{safe_prompt}_{args.seed}.pkl"
         filepath = os.path.join(calibration_dir, filename)
         with open(filepath, "wb") as f:
             pickle.dump(unet_inputs, f)
@@ -142,38 +148,28 @@ def generate_calibration_data(pipe, args, calibration_dir):
 
 
 def unet_data_loader(data_dir, device="cpu", calibration_nsamples=None):
-    """Load serialized UNet inputs from calibration directory."""
+    """Return a generator that yields serialized UNet inputs on demand."""
 
-    dataloader = []
-    skip_load = False
-    for file in sorted(os.listdir(data_dir)):
-        if file.endswith(".pkl"):
+    def loader():
+        count = 0
+        for file in sorted(os.listdir(data_dir)):
+            if not file.endswith(".pkl"):
+                continue
             filepath = os.path.join(data_dir, file)
             with open(filepath, "rb") as data:
                 try:
-                    while not skip_load:
+                    while True:
                         unet_data = pickle.load(data)
                         for inp in unet_data:
-                            dataloader.append(
-                                [x.to(torch.float32).to(device) for x in inp]
-                            )
-                            for i, t in enumerate(dataloader[-1]):
-                                _log_device(
-                                    f"Loaded tensor device {len(dataloader)-1}_{i}", t
-                                )
-                            if (
-                                calibration_nsamples
-                                and len(dataloader) >= calibration_nsamples
-                            ):
-                                skip_load = True
-                                break
+                            yield [x.to(torch.float32).to(device) for x in inp]
+                            count += 1
+                            if calibration_nsamples and count >= calibration_nsamples:
+                                logger.info(f"Total calibration samples: {count}")
+                                return
                 except EOFError:
                     pass
-        if skip_load:
-            break
-
-    logger.info(f"Total calibration samples: {len(dataloader)}")
-    return dataloader
+        logger.info(f"Total calibration samples: {count}")
+    return loader
 
 
 def quantize_module_config(module_name):
@@ -317,7 +313,7 @@ def _to_coreml_unet_inputs(
     return tuple(inputs)
 
 
-def quantize(model, config, calibration_data):
+def quantize(model, config, calibration_loader_fn):
     """Post training activation quantization using calibration data."""
 
     submodules = dict(model.named_modules(remove_duplicate=True))
@@ -329,7 +325,13 @@ def quantize(model, config, calibration_data):
     config.non_traceable_module_names = non_traceable
     config.preserved_attributes = ["config", "device"]
 
-    sample_input = _to_coreml_unet_inputs(*calibration_data[0])
+    sample_iter = calibration_loader_fn()
+    try:
+        first_sample = next(sample_iter)
+    except StopIteration as e:
+        raise ValueError("Calibration data is empty") from e
+
+    sample_input = _to_coreml_unet_inputs(*first_sample)
     for i, t in enumerate(sample_input):
         _log_device(f"Sample input tensor {i}", t)
     quantizer = LinearQuantizer(model, config)
@@ -342,7 +344,7 @@ def quantize(model, config, calibration_data):
 
     quantizer.step()
     logger.info("Calibrate")
-    for idx, data in enumerate(calibration_data):
+    for idx, data in enumerate(calibration_loader_fn()):
         logger.info(f"Calibration data sample: {idx}")
         prepared_model(*_to_coreml_unet_inputs(*data))
 
@@ -354,7 +356,7 @@ def quantize(model, config, calibration_data):
 
 
 def _prepare_calibration(pipe, args, calib_dir):
-    """Generate calibration data if needed and return dataloader."""
+    """Generate calibration data if needed and return a loader function."""
     if args.generate_calibration_data or not os.path.exists(calib_dir):
         logger.info("Generating calibration data for activation quantization")
         generate_calibration_data(pipe, args, calib_dir)
@@ -362,11 +364,17 @@ def _prepare_calibration(pipe, args, calib_dir):
     # Loading calibration samples on CPU avoids device mismatch errors during
     # preparation.
     device = "cpu"
-    dataloader = unet_data_loader(calib_dir, device, args.calibration_nsamples)
-    if dataloader:
-        for i, t in enumerate(dataloader[0]):
+    dataloader_fn = unet_data_loader(calib_dir, device, args.calibration_nsamples)
+
+    sample_iter = dataloader_fn()
+    try:
+        first_sample = next(sample_iter)
+        for i, t in enumerate(first_sample):
             _log_device(f"Calibration sample[0] tensor {i}", t)
-    return dataloader
+    except StopIteration:
+        pass
+
+    return dataloader_fn
 
 
 def register_input_preprocessing_hook(pipe):
@@ -494,7 +502,7 @@ def layerwise_sensitivity(pipe, args):
     """Compute layer-wise PSNR by quantizing one layer at a time."""
 
     calib_dir = os.path.join(args.o, "calibration_data")
-    dataloader = _prepare_calibration(pipe, args, calib_dir)
+    dataloader_fn = _prepare_calibration(pipe, args, calib_dir)
 
     # Replace diffusers UNet with fx-traceable implementation before analysis
     if args.xl_version:
@@ -559,7 +567,7 @@ def layerwise_sensitivity(pipe, args):
 
         logger.info(f"Quantizing UNet layer: {module_name}")
         config = quantize_module_config(module_name)
-        quantized_unet = quantize(deepcopy(pipe.unet), config, dataloader)
+        quantized_unet = quantize(deepcopy(pipe.unet), config, dataloader_fn)
         _patch_add_embedding_linear_attrs(quantized_unet)
 
         quantized_unet.to(device)
@@ -619,7 +627,7 @@ def convert_quantized_unet(pipe, args):
     calib_dir = os.path.join(
         args.o, f"calibration_data"
     )
-    dataloader = _prepare_calibration(pipe, args, calib_dir)
+    dataloader_fn = _prepare_calibration(pipe, args, calib_dir)
 
     # Create a reference UNet and gather text encoder metadata before
     # releasing the pipeline to free memory.
@@ -722,9 +730,9 @@ def convert_quantized_unet(pipe, args):
     reference_unet.to(quant_device)
     _log_device("Reference UNet", reference_unet)
 
-    quant_unet = quantize(reference_unet, config, dataloader)
-    # reference_unet and calibration data are no longer needed
-    del reference_unet, dataloader
+    quant_unet = quantize(reference_unet, config, dataloader_fn)
+    # reference_unet and calibration loader are no longer needed
+    del reference_unet, dataloader_fn
     gc.collect()
     _log_device("Quantized UNet", quant_unet)
 
