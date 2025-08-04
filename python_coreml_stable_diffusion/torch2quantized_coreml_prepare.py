@@ -404,13 +404,18 @@ def _patch_add_embedding_linear_attrs(unet):
 
 
 def prepare_pipe(pipe, unet):
-    """Create a new pipeline with ``unet`` as the noise predictor."""
+    """Swap ``pipe.unet`` with ``unet`` and register preprocessing hook.
 
-    new_pipe = deepcopy(pipe)
-    unet.to(new_pipe.unet.device)
-    new_pipe.unet = unet
-    pre_hook_handle = register_input_preprocessing_hook(new_pipe)
-    return new_pipe, pre_hook_handle
+    Returns the previous UNet and the hook handle so the caller can restore the
+    original state after running inference.
+    """
+
+    prev_unet = pipe.unet
+    device = next(prev_unet.parameters()).device
+    unet.to(device)
+    pipe.unet = unet
+    pre_hook_handle = register_input_preprocessing_hook(pipe)
+    return prev_unet, pre_hook_handle
 
 
 def run_pipe(pipe, prompts, negative_prompts, seed):
@@ -438,9 +443,11 @@ def layerwise_sensitivity(pipe, args):
     ).eval()
     reference_unet.load_state_dict(pipe.unet.state_dict())
     _patch_add_embedding_linear_attrs(reference_unet)
-    # ``prepare_pipe`` will move ``reference_unet`` to the pipeline's device, so we
-    # keep it on CPU here to avoid an extra transfer when CUDA is available.
-    pipe, _ = prepare_pipe(pipe, reference_unet)
+
+    # Replace the diffusers UNet with the traceable reference implementation.
+    # ``prepare_pipe`` moves the new UNet to the current device and returns the
+    # original UNet so it can be released to free memory.
+    orig_unet, handle = prepare_pipe(pipe, reference_unet)
 
     prompts = CALIBRATION_DATA if not getattr(args, "test", False) else CALIBRATION_DATA[:1]
     negative_prompts = (
@@ -451,6 +458,17 @@ def layerwise_sensitivity(pipe, args):
 
     logger.info("Generating reference outputs")
     ref_out = run_pipe(pipe, prompts, negative_prompts, args.seed)
+    handle.remove()
+    del orig_unet
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Keep the reference UNet on CPU so only one UNet resides on the device at
+    # a time during per-layer sweeps.
+    device = next(pipe.unet.parameters()).device
+    pipe.unet.to("cpu")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     quantizable_modules = get_quantizable_modules(pipe.unet)
     results = {"conv": {}, "einsum": {}, "model_version": args.model_version}
@@ -458,19 +476,22 @@ def layerwise_sensitivity(pipe, args):
     for module_type, module_name in tqdm(quantizable_modules):
         logger.info(f"Quantizing UNet layer: {module_name}")
         config = quantize_module_config(module_name)
-        # Calibration samples are stored on CPU, so quantize a CPU copy of the
-        # module and let ``prepare_pipe`` move it back to the pipeline's device
-        # for evaluation.
-        quantized_unet = quantize(deepcopy(pipe.unet).to("cpu"), config, dataloader)
+        quantized_unet = quantize(deepcopy(pipe.unet), config, dataloader)
         _patch_add_embedding_linear_attrs(quantized_unet)
-        q_pipe, handle = prepare_pipe(pipe, quantized_unet)
-        test_out = run_pipe(q_pipe, prompts, negative_prompts, args.seed)
+
+        quantized_unet.to(device)
+        prev_unet, handle = prepare_pipe(pipe, quantized_unet)
+        test_out = run_pipe(pipe, prompts, negative_prompts, args.seed)
         psnr = [float(f"{torch2coreml.compute_psnr(r, t):.1f}") for r, t in zip(ref_out, test_out)]
         avg_psnr = sum(psnr) / len(psnr)
         logger.info(f"AVG PSNR: {avg_psnr}")
         results[module_type][module_name] = avg_psnr
         handle.remove()
-        del quantized_unet, q_pipe
+        pipe.unet = prev_unet
+        pipe.unet.to("cpu")
+        del quantized_unet
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         gc.collect()
 
     recipe_json_path = os.path.join(
