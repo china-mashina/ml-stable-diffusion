@@ -412,6 +412,12 @@ def prepare_pipe(pipe, unet):
 
     prev_unet = pipe.unet
     device = next(prev_unet.parameters()).device
+    # Move the previous UNet off the device before loading the new one to avoid
+    # temporarily holding two full models in GPU memory.
+    prev_unet.to("cpu")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     unet.to(device)
     pipe.unet = unet
     pre_hook_handle = register_input_preprocessing_hook(pipe)
