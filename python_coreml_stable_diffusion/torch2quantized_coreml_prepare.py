@@ -414,8 +414,14 @@ def _move_tensor_attrs(module, device):
     device-mismatch errors.
     """
 
-    for name, attr in vars(module).items():
-        if torch.is_tensor(attr):
+    for name in dir(module):
+        if name.startswith("_"):
+            continue
+        try:
+            attr = getattr(module, name)
+        except Exception:
+            continue
+        if torch.is_tensor(attr) and attr.device != device:
             setattr(module, name, attr.to(device))
     for child in module.children():
         _move_tensor_attrs(child, device)
