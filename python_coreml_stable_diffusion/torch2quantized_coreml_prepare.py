@@ -10,6 +10,7 @@ import gc
 import logging
 import os
 import pickle
+import json
 import operator
 from collections import OrderedDict
 from copy import deepcopy
@@ -17,6 +18,7 @@ from copy import deepcopy
 import coremltools as ct
 import numpy as np
 import torch
+from tqdm import tqdm
 from coremltools.optimize.torch.quantization import (
     LinearQuantizer,
     LinearQuantizerConfig,
@@ -121,7 +123,11 @@ def generate_calibration_data(pipe, args, calibration_dir):
         NEGATIVE_CALIBRATION_DATA if not getattr(args, "test", False) else NEGATIVE_CALIBRATION_DATA[:1]
     )
 
-    for prompt, negative_prompt in zip(prompts, negative_prompts):
+    import re
+
+    for idx, (prompt, negative_prompt) in enumerate(
+        zip(prompts, negative_prompts)
+    ):
         gen = torch.manual_seed(args.seed)
         pipe(
             prompt=prompt,
@@ -130,7 +136,9 @@ def generate_calibration_data(pipe, args, calibration_dir):
             num_inference_steps=4,
             guidance_scale=0,
         )
-        filename = "_".join(prompt.split(" ")) + "_" + str(args.seed) + ".pkl"
+        safe_prompt = re.sub(r"[^\w\- ]", "", prompt)
+        safe_prompt = "_".join(safe_prompt.split())[:50]
+        filename = f"{idx:04d}_{safe_prompt}_{args.seed}.pkl"
         filepath = os.path.join(calibration_dir, filename)
         with open(filepath, "wb") as f:
             pickle.dump(unet_inputs, f)
@@ -140,38 +148,109 @@ def generate_calibration_data(pipe, args, calibration_dir):
 
 
 def unet_data_loader(data_dir, device="cpu", calibration_nsamples=None):
-    """Load serialized UNet inputs from calibration directory."""
+    """Return a generator that yields serialized UNet inputs on demand."""
 
-    dataloader = []
-    skip_load = False
-    for file in sorted(os.listdir(data_dir)):
-        if file.endswith(".pkl"):
+    def loader():
+        count = 0
+        for file in sorted(os.listdir(data_dir)):
+            if not file.endswith(".pkl"):
+                continue
             filepath = os.path.join(data_dir, file)
             with open(filepath, "rb") as data:
                 try:
-                    while not skip_load:
+                    while True:
                         unet_data = pickle.load(data)
                         for inp in unet_data:
-                            dataloader.append(
-                                [x.to(torch.float32).to(device) for x in inp]
-                            )
-                            for i, t in enumerate(dataloader[-1]):
-                                _log_device(
-                                    f"Loaded tensor device {len(dataloader)-1}_{i}", t
-                                )
-                            if (
-                                calibration_nsamples
-                                and len(dataloader) >= calibration_nsamples
-                            ):
-                                skip_load = True
-                                break
+                            yield [x.to(torch.float32).to(device) for x in inp]
+                            count += 1
+                            if calibration_nsamples and count >= calibration_nsamples:
+                                logger.info(f"Total calibration samples: {count}")
+                                return
                 except EOFError:
                     pass
-        if skip_load:
-            break
+        logger.info(f"Total calibration samples: {count}")
+    return loader
 
-    logger.info(f"Total calibration samples: {len(dataloader)}")
-    return dataloader
+
+def quantize_module_config(module_name):
+    """Return config that quantizes only the specified module."""
+
+    config = LinearQuantizerConfig(
+        global_config=ModuleLinearQuantizerConfig(
+            milestones=[0, 1000, 1000, 0],
+            weight_dtype=torch.float32,
+            activation_dtype=torch.float32,
+        ),
+        module_name_configs={
+            module_name: ModuleLinearQuantizerConfig(
+                quantization_scheme="symmetric",
+                milestones=[0, 1000, 1000, 0],
+            )
+        },
+        module_type_configs={
+            torch.cat: None,
+            torch.nn.GroupNorm: None,
+            torch.nn.SiLU: None,
+            torch.nn.functional.gelu: None,
+            operator.add: None,
+        },
+    )
+    return config
+
+
+def get_quantizable_modules(unet):
+    """Return list of leaf modules that can be quantized."""
+
+    quantizable_modules = []
+    for name, module in unet.named_modules():
+        if len(list(module.children())) > 0:
+            continue
+        if isinstance(module, torch.nn.Conv2d):
+            quantizable_modules.append(("conv", name))
+        if isinstance(module, Einsum):
+            quantizable_modules.append(("einsum", name))
+    return quantizable_modules
+
+
+def recipe_overrides_for_inference_speed(conv_layers, skipped_conv):
+    """Force quantization for known compute hotspots."""
+
+    for layer in conv_layers:
+        # Quantize upsample stack convolutions
+        if "upsamplers" in layer and layer in skipped_conv:
+            logger.info(f"Removing {layer} from skip list")
+            skipped_conv.remove(layer)
+        # Quantize conv1 in up path resnets
+        if (
+            "up_blocks" in layer
+            and "resnets" in layer
+            and "conv1" in layer
+            and layer in skipped_conv
+        ):
+            logger.info(f"Removing {layer} from skip list")
+            skipped_conv.remove(layer)
+
+
+def recipe_overrides_for_quality(conv_layers, einsum_layers, skipped_conv, skipped_einsum):
+    """Skip layers that are sensitive to quantization artifacts."""
+
+    for layer in conv_layers:
+        # to_out projections from attention blocks
+        if "to_out" in layer:
+            skipped_conv.add(layer)
+        # First and last UNet convolutions
+        if layer in {"conv_in", "conv_out"}:
+            skipped_conv.add(layer)
+        # High resolution up path last resblocks
+        if "up_blocks.3" in layer:
+            skipped_conv.add(layer)
+        # Mid-block attention convolutions
+        if "mid_block.attentions" in layer:
+            skipped_conv.add(layer)
+
+    for layer in einsum_layers:
+        if "mid_block.attentions" in layer:
+            skipped_einsum.add(layer)
 
 
 def quantize_cumulative_config(skip_conv_layers, skip_einsum_layers):
@@ -234,7 +313,7 @@ def _to_coreml_unet_inputs(
     return tuple(inputs)
 
 
-def quantize(model, config, calibration_data):
+def quantize(model, config, calibration_loader_fn):
     """Post training activation quantization using calibration data."""
 
     submodules = dict(model.named_modules(remove_duplicate=True))
@@ -246,7 +325,13 @@ def quantize(model, config, calibration_data):
     config.non_traceable_module_names = non_traceable
     config.preserved_attributes = ["config", "device"]
 
-    sample_input = _to_coreml_unet_inputs(*calibration_data[0])
+    sample_iter = calibration_loader_fn()
+    try:
+        first_sample = next(sample_iter)
+    except StopIteration as e:
+        raise ValueError("Calibration data is empty") from e
+
+    sample_input = _to_coreml_unet_inputs(*first_sample)
     for i, t in enumerate(sample_input):
         _log_device(f"Sample input tensor {i}", t)
     quantizer = LinearQuantizer(model, config)
@@ -259,7 +344,7 @@ def quantize(model, config, calibration_data):
 
     quantizer.step()
     logger.info("Calibrate")
-    for idx, data in enumerate(calibration_data):
+    for idx, data in enumerate(calibration_loader_fn()):
         logger.info(f"Calibration data sample: {idx}")
         prepared_model(*_to_coreml_unet_inputs(*data))
 
@@ -271,7 +356,7 @@ def quantize(model, config, calibration_data):
 
 
 def _prepare_calibration(pipe, args, calib_dir):
-    """Generate calibration data if needed and return dataloader."""
+    """Generate calibration data if needed and return a loader function."""
     if args.generate_calibration_data or not os.path.exists(calib_dir):
         logger.info("Generating calibration data for activation quantization")
         generate_calibration_data(pipe, args, calib_dir)
@@ -279,11 +364,244 @@ def _prepare_calibration(pipe, args, calib_dir):
     # Loading calibration samples on CPU avoids device mismatch errors during
     # preparation.
     device = "cpu"
-    dataloader = unet_data_loader(calib_dir, device, args.calibration_nsamples)
-    if dataloader:
-        for i, t in enumerate(dataloader[0]):
+    dataloader_fn = unet_data_loader(calib_dir, device, args.calibration_nsamples)
+
+    sample_iter = dataloader_fn()
+    try:
+        first_sample = next(sample_iter)
+        for i, t in enumerate(first_sample):
             _log_device(f"Calibration sample[0] tensor {i}", t)
-    return dataloader
+    except StopIteration:
+        pass
+
+    return dataloader_fn
+
+
+def register_input_preprocessing_hook(pipe):
+    """Register hook to adapt pipeline inputs for the quantized UNet."""
+
+    def hook(_, args, kwargs):
+        sample = args[0]
+        timestep = args[1]
+        encoder_hidden_states = kwargs["encoder_hidden_states"]
+        time_ids = kwargs.get("time_ids")
+        text_embeds = kwargs.get("text_embeds")
+        if "added_cond_kwargs" in kwargs:
+            added = kwargs["added_cond_kwargs"]
+            if isinstance(added, dict):
+                time_ids = time_ids or added.get("time_ids")
+                text_embeds = text_embeds or added.get("text_embeds")
+        modified = _to_coreml_unet_inputs(
+            sample, timestep, encoder_hidden_states, time_ids, text_embeds
+        )
+        return (modified, {})
+
+    return pipe.unet.register_forward_pre_hook(hook, with_kwargs=True)
+
+
+def _patch_add_embedding_linear_attrs(unet):
+    """Provide Linear-like attributes for Conv-based timestep embeddings."""
+
+    if hasattr(unet, "add_embedding"):
+        lin1 = getattr(unet.add_embedding, "linear_1", None)
+        if lin1 is not None and not hasattr(lin1, "in_features"):
+            if hasattr(lin1, "in_channels"):
+                lin1.in_features = lin1.in_channels
+            elif hasattr(lin1, "conv") and hasattr(lin1.conv, "in_channels"):
+                lin1.in_features = lin1.conv.in_channels
+
+
+def _move_tensor_attrs(module, device):
+    """Move tensor attributes that are not registered buffers to ``device``.
+
+    ``torch.nn.Module.to`` only migrates parameters and registered buffers.
+    Quantized models produced by ``torch.ao`` stash scale and zero-point values
+    as plain attributes, leaving them on the CPU even after ``to(device)`` is
+    called.  This helper walks the module hierarchy and explicitly moves any
+    such tensors so the module can execute on the desired device without
+    device-mismatch errors.
+    """
+
+    for name in dir(module):
+        if name.startswith("_"):
+            continue
+        try:
+            attr = getattr(module, name)
+        except Exception:
+            continue
+        if torch.is_tensor(attr) and attr.device != device:
+            setattr(module, name, attr.to(device))
+    for child in module.children():
+        _move_tensor_attrs(child, device)
+
+
+def _ensure_module_dtype(module):
+    """Ensure ``module`` exposes a ``dtype`` attribute.
+
+    ``diffusers.DiffusionPipeline`` expects each component to define ``dtype``
+    when moving the pipeline across devices. Quantized ``GraphModule`` instances
+    lack this attribute, so we derive it from the first parameter if necessary.
+    """
+
+    if not hasattr(module, "dtype"):
+        try:
+            module.dtype = next(module.parameters()).dtype
+        except StopIteration:
+            module.dtype = torch.get_default_dtype()
+
+
+def prepare_pipe(pipe, unet, device=None):
+    """Swap ``pipe.unet`` with ``unet`` and register preprocessing hook.
+
+    Parameters
+    ----------
+    pipe: DiffusionPipeline
+        Pipeline whose UNet will be replaced.
+    unet: torch.nn.Module
+        Replacement UNet.
+    device: str or torch.device, optional
+        Device on which the pipeline should run.  If ``None``, the device of
+        the current ``pipe.unet`` is used.
+
+    Returns
+    -------
+    Tuple[torch.nn.Module, RemovableHandle]
+        The previous UNet (now moved to CPU) and the forward-pre-hook handle so
+        callers can restore the original state after running inference.
+    """
+
+    prev_unet = pipe.unet
+    target_device = device or next(prev_unet.parameters()).device
+
+    # Move the previous UNet off the device before loading the new one to avoid
+    # temporarily holding two full models in GPU memory.
+    prev_unet.to("cpu")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    unet.to(target_device)
+    _ensure_module_dtype(unet)
+    pipe.unet = unet
+    # Ensure the rest of the pipeline is aware of the new execution device.
+    pipe.to(target_device)
+
+    pre_hook_handle = register_input_preprocessing_hook(pipe)
+    return prev_unet, pre_hook_handle
+
+
+def run_pipe(pipe, prompts, negative_prompts, seed):
+    gen = torch.manual_seed(seed)
+    kwargs = dict(prompt=prompts, output_type="latent", generator=gen)
+    if negative_prompts is not None:
+        kwargs["negative_prompt"] = negative_prompts
+        kwargs["guidance_scale"] = 0
+    return np.array([latent.cpu().numpy() for latent in pipe(**kwargs).images])
+
+
+def layerwise_sensitivity(pipe, args):
+    """Compute layer-wise PSNR by quantizing one layer at a time."""
+
+    calib_dir = os.path.join(args.o, "calibration_data")
+    dataloader_fn = _prepare_calibration(pipe, args, calib_dir)
+
+    # Replace diffusers UNet with fx-traceable implementation before analysis
+    if args.xl_version:
+        unet_cls = unet_mod.UNet2DConditionModelXL
+    else:
+        unet_cls = unet_mod.UNet2DConditionModel
+    reference_unet = unet_cls(
+        support_controlnet=args.unet_support_controlnet, **pipe.unet.config
+    ).eval()
+    reference_unet.load_state_dict(pipe.unet.state_dict())
+    _patch_add_embedding_linear_attrs(reference_unet)
+
+    # Replace the diffusers UNet with the traceable reference implementation.
+    # ``prepare_pipe`` moves the new UNet to the current device and returns the
+    # original UNet so it can be released to free memory.
+    orig_unet, handle = prepare_pipe(pipe, reference_unet)
+
+    prompts = CALIBRATION_DATA if not getattr(args, "test", False) else CALIBRATION_DATA[:1]
+    negative_prompts = (
+        NEGATIVE_CALIBRATION_DATA
+        if not getattr(args, "test", False)
+        else NEGATIVE_CALIBRATION_DATA[:1]
+    )
+
+    logger.info("Generating reference outputs")
+    ref_out = run_pipe(pipe, prompts, negative_prompts, args.seed)
+    handle.remove()
+    del orig_unet
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Keep the reference UNet on CPU so only one UNet resides on the device at
+    # a time during per-layer sweeps.
+    device = next(pipe.unet.parameters()).device
+    pipe.unet.to("cpu")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    quantizable_modules = get_quantizable_modules(pipe.unet)
+    results = {"conv": {}, "einsum": {}, "model_version": args.model_version}
+
+    layerwise_dir = os.path.join(
+        args.o, f"{args.model_version.replace('/', '_')}_layerwise"
+    )
+    os.makedirs(layerwise_dir, exist_ok=True)
+
+    for module_type, module_name in tqdm(quantizable_modules):
+        module_dir = os.path.join(layerwise_dir, module_type)
+        os.makedirs(module_dir, exist_ok=True)
+        file_stem = module_name.replace(".", "_")
+        file_path = os.path.join(module_dir, f"{file_stem}.json")
+
+        if os.path.exists(file_path):
+            with open(file_path, "r") as f:
+                data = json.load(f)
+            psnr = data.get("psnr") if isinstance(data, dict) else float(data)
+            results[module_type][module_name] = psnr
+            logger.info(
+                f"Loaded existing layer-wise result for {module_name}: PSNR {psnr}"
+            )
+            continue
+
+        logger.info(f"Quantizing UNet layer: {module_name}")
+        config = quantize_module_config(module_name)
+        quantized_unet = quantize(deepcopy(pipe.unet), config, dataloader_fn)
+        _patch_add_embedding_linear_attrs(quantized_unet)
+
+        quantized_unet.to(device)
+        _move_tensor_attrs(quantized_unet, device)
+        prev_unet, handle = prepare_pipe(pipe, quantized_unet, device)
+        test_out = run_pipe(pipe, prompts, negative_prompts, args.seed)
+        psnr = [
+            float(f"{torch2coreml.compute_psnr(r, t):.1f}")
+            for r, t in zip(ref_out, test_out)
+        ]
+        avg_psnr = sum(psnr) / len(psnr)
+        logger.info(f"AVG PSNR: {avg_psnr}")
+        results[module_type][module_name] = avg_psnr
+
+        with open(file_path, "w") as f:
+            json.dump({"name": module_name, "psnr": avg_psnr}, f)
+
+        handle.remove()
+        pipe.unet = prev_unet
+        pipe.unet.to("cpu")
+        del quantized_unet
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+    recipe_json_path = os.path.join(
+        args.o, f"{args.model_version.replace('/', '_')}_quantization_recipe.json"
+    )
+    with open(recipe_json_path, "w") as f:
+        json.dump(results, f, indent=2)
+
+    logger.info(
+        f"Layer-wise sensitivity results saved to {layerwise_dir} and {recipe_json_path}"
+    )
 
 
 def convert_quantized_unet(pipe, args):
@@ -309,7 +627,7 @@ def convert_quantized_unet(pipe, args):
     calib_dir = os.path.join(
         args.o, f"calibration_data"
     )
-    dataloader = _prepare_calibration(pipe, args, calib_dir)
+    dataloader_fn = _prepare_calibration(pipe, args, calib_dir)
 
     # Create a reference UNet and gather text encoder metadata before
     # releasing the pipeline to free memory.
@@ -350,8 +668,59 @@ def convert_quantized_unet(pipe, args):
     del pipe
     gc.collect()
 
+    # Quantization recipe from layerwise sensitivity
+    layerwise_dir = os.path.join(
+        args.o, f"{args.model_version.replace('/', '_')}_layerwise"
+    )
+    results = None
+    if os.path.isdir(layerwise_dir):
+        tmp = {"conv": {}, "einsum": {}}
+        for module_type in ("conv", "einsum"):
+            t_dir = os.path.join(layerwise_dir, module_type)
+            if os.path.isdir(t_dir):
+                for fname in os.listdir(t_dir):
+                    if fname.endswith(".json"):
+                        with open(os.path.join(t_dir, fname), "r") as f:
+                            data = json.load(f)
+                        name = data.get("name") or fname[:-5].replace("_", ".")
+                        psnr = data.get("psnr")
+                        if psnr is not None:
+                            tmp[module_type][name] = psnr
+        if tmp["conv"] or tmp["einsum"]:
+            results = tmp
+
+    recipe_json_path = os.path.join(
+        args.o, f"{args.model_version.replace('/', '_')}_quantization_recipe.json"
+    )
+    if results is None and os.path.exists(recipe_json_path):
+        with open(recipe_json_path, "r") as f:
+            results = json.load(f)
+
+    if results is not None:
+        skipped_conv = {
+            layer for layer, psnr in results["conv"].items() if psnr < args.conv_psnr
+        }
+        skipped_einsum = set()
+        for layer, psnr in results["einsum"].items():
+            if "attn" in layer or "attention" in layer:
+                thresh = args.attn_psnr
+            else:
+                thresh = args.mlp_psnr
+            if psnr < thresh:
+                skipped_einsum.add(layer)
+        conv_layers = list(results["conv"].keys())
+        einsum_layers = list(results["einsum"].keys())
+        recipe_overrides_for_inference_speed(conv_layers, skipped_conv)
+        recipe_overrides_for_quality(
+            conv_layers, einsum_layers, skipped_conv, skipped_einsum
+        )
+    else:
+        logger.warning("Quantization recipe not found. Quantizing all layers.")
+        skipped_conv = set()
+        skipped_einsum = set()
+
     # Quantize UNet weights and activations (W8A8 by default)
-    config = quantize_cumulative_config(set(), set())
+    config = quantize_cumulative_config(skipped_conv, skipped_einsum)
     logger.info("Quantizing UNet model")
 
     # Quantization must run on CPU. Keeping the resulting model on the same
@@ -361,9 +730,9 @@ def convert_quantized_unet(pipe, args):
     reference_unet.to(quant_device)
     _log_device("Reference UNet", reference_unet)
 
-    quant_unet = quantize(reference_unet, config, dataloader)
-    # reference_unet and calibration data are no longer needed
-    del reference_unet, dataloader
+    quant_unet = quantize(reference_unet, config, dataloader_fn)
+    # reference_unet and calibration loader are no longer needed
+    del reference_unet, dataloader_fn
     gc.collect()
     _log_device("Quantized UNet", quant_unet)
 
@@ -491,7 +860,8 @@ def chunk_unet(args):
 def main(args):
     os.makedirs(args.o, exist_ok=True)
 
-    # Load diffusers pipeline as in torch2coreml
+    # Load diffusers pipeline as in ``torch2coreml``.  Run the pipeline on CUDA
+    # when available to speed up layer-wise sensitivity sweeps.
     pipe = torch2coreml.get_pipeline(args)
     if torch.cuda.is_available():
         pipe.to(device="cuda", dtype=torch.float32)
@@ -511,7 +881,10 @@ def main(args):
     unet_mod.ATTENTION_IMPLEMENTATION_IN_EFFECT = unet_mod.AttentionImplementations[
         args.attention_implementation
     ]
-    
+
+    if args.layerwise_sensitivity:
+        layerwise_sensitivity(pipe, args)
+
     if args.convert_unet:
         convert_quantized_unet(pipe, args)
         del pipe
@@ -541,6 +914,29 @@ def parser_spec():
         "--test",
         action="store_true",
         help="Run calibration data generation on a single prompt",
+    )
+    parser.add_argument(
+        "--layerwise-sensitivity",
+        action="store_true",
+        help="Compute compression sensitivity per-layer, by quantizing one layer at a time",
+    )
+    parser.add_argument(
+        "--conv-psnr",
+        type=float,
+        default=42.0,
+        help="PSNR threshold for convolution layers",
+    )
+    parser.add_argument(
+        "--attn-psnr",
+        type=float,
+        default=35.0,
+        help="PSNR threshold for attention linear layers",
+    )
+    parser.add_argument(
+        "--mlp-psnr",
+        type=float,
+        default=36.0,
+        help="PSNR threshold for MLP linear layers",
     )
     return parser
 
