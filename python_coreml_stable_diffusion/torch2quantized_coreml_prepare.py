@@ -406,8 +406,15 @@ def convert_quantized_unet(pipe, args):
     _log_device("Reference UNet", reference_unet)
 
     quant_unet = quantize(reference_unet, config, dataloader)
-    # reference_unet and calibration data are no longer needed
-    del reference_unet, dataloader
+    # reference_unet, calibration data, and quantization helpers are no longer needed
+    del (
+        reference_unet,
+        dataloader,
+        skipped_conv_layers,
+        skipped_einsum_layers,
+        quantizable_modules,
+        config,
+    )
     gc.collect()
     _log_device("Quantized UNet", quant_unet)
 
