@@ -14,6 +14,7 @@ import operator
 from collections import OrderedDict
 from copy import deepcopy
 import re
+import psutil
 import coremltools as ct
 import numpy as np
 import torch
@@ -49,6 +50,46 @@ def _log_device(name, obj):
             pass
     if dev is not None:
         logger.info(f"{name} device: {dev}")
+
+
+def _log_process_memory(label: str) -> None:
+    """Log the resident set size of the current process."""
+    proc = psutil.Process(os.getpid())
+    mem = proc.memory_info().rss / (1024 ** 3)
+    logger.info(f"{label} RSS: {mem:.2f} GB")
+
+
+def _model_size_gb(model: torch.nn.Module) -> float:
+    """Approximate size of a model's parameters and buffers in GB."""
+    param_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+    buffer_bytes = sum(b.numel() * b.element_size() for b in model.buffers())
+    return (param_bytes + buffer_bytes) / (1024 ** 3)
+
+
+def _log_model_size(name: str, model: torch.nn.Module) -> None:
+    try:
+        size = _model_size_gb(model)
+        logger.info(f"{name} size: {size:.2f} GB")
+    except Exception:
+        logger.info(f"{name} size: <unknown>")
+
+
+def _dataloader_size_gb(dataloader) -> float:
+    """Approximate size of serialized calibration data in GB."""
+    total_bytes = 0
+    for sample in dataloader:
+        for tensor in sample:
+            if torch.is_tensor(tensor):
+                total_bytes += tensor.nelement() * tensor.element_size()
+    return total_bytes / (1024 ** 3)
+
+
+def _tensor_dict_size_gb(tensors: dict) -> float:
+    total = 0
+    for t in tensors.values():
+        if torch.is_tensor(t):
+            total += t.nelement() * t.element_size()
+    return total / (1024 ** 3)
 
 
 torch.set_grad_enabled(False)
@@ -336,11 +377,24 @@ def convert_quantized_unet(pipe, args):
         logger.info(f"`unet` already exists at {out_path}, skipping conversion.")
         return
 
+    _log_model_size("Pipeline UNet", pipe.unet)
+    if getattr(pipe, "text_encoder", None) is not None:
+        _log_model_size("TextEncoder", pipe.text_encoder)
+    if getattr(pipe, "text_encoder_2", None) is not None:
+        _log_model_size("TextEncoder2", pipe.text_encoder_2)
+    if getattr(pipe, "vae", None) is not None:
+        _log_model_size("VAE", pipe.vae)
+    _log_process_memory("Pipeline loaded")
+
     # Calibration data
     calib_dir = os.path.join(
         args.o, f"calibration_data"
     )
     dataloader = _prepare_calibration(pipe, args, calib_dir)
+    logger.info(
+        f"Calibration data size: {_dataloader_size_gb(dataloader):.2f} GB"
+    )
+    _log_process_memory("After loading calibration data")
 
     # Create a reference UNet and gather text encoder metadata before
     # releasing the pipeline to free memory.
@@ -406,6 +460,8 @@ def convert_quantized_unet(pipe, args):
     _log_device("Reference UNet", reference_unet)
 
     quant_unet = quantize(reference_unet, config, dataloader)
+    _log_model_size("Quantized UNet", quant_unet)
+    _log_process_memory("After quantization")
     # reference_unet, calibration data, and quantization helpers are no longer needed
     del (
         reference_unet,
@@ -416,6 +472,7 @@ def convert_quantized_unet(pipe, args):
         config,
     )
     gc.collect()
+    _log_process_memory("After quantization cleanup")
     _log_device("Quantized UNet", quant_unet)
 
     # Prepare sample input shapes
@@ -479,10 +536,25 @@ def convert_quantized_unet(pipe, args):
 
     sample_inputs_spec = {k: (v.shape, v.dtype) for k, v in sample_inputs.items()}
     logger.info(f"Sample UNet inputs spec: {sample_inputs_spec}")
+    logger.info(
+        f"Sample inputs size: {_tensor_dict_size_gb(sample_inputs):.4f} GB"
+    )
+    _log_process_memory("Before JIT trace")
+    mem = psutil.virtual_memory()
+    logger.info(
+        "Total: %.2f GB, Available: %.2f GB, Used: %.2f GB, Free: %.2f GB"
+        % (
+            mem.total / (1024 ** 3),
+            mem.available / (1024 ** 3),
+            mem.used / (1024 ** 3),
+            mem.free / (1024 ** 3),
+        )
+    )
 
     logger.info("JIT tracing quantized UNet")
     traced_unet = torch.jit.trace(quant_unet, list(sample_inputs.values()))
     _log_device("Traced UNet", traced_unet)
+    _log_process_memory("After JIT trace")
 
     coreml_inputs = {k: v.numpy().astype(np.float32) for k, v in sample_inputs.items()}
     coreml_unet, out_path = torch2coreml._convert_to_coreml(
@@ -515,9 +587,11 @@ def convert_quantized_unet(pipe, args):
 
     coreml_unet.save(out_path)
     logger.info(f"Saved quantized unet into {out_path}")
+    _log_process_memory("After saving CoreML model")
 
     del quant_unet, traced_unet, coreml_unet
     gc.collect()
+    _log_process_memory("After deleting temporary models")
 
     if args.chunk_unet and not unet_chunks_exist:
         logger.info("Chunking unet in two approximately equal MLModels")

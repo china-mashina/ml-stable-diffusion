@@ -9,3 +9,4 @@ pytest
 invisible-watermark
 safetensors
 matplotlib
+psutil==7.0.0
