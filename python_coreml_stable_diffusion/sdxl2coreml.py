@@ -22,12 +22,7 @@ DEFAULT_ARGS = [
     "output",
     "--generate-calibration-data",
     "--min-deployment-target",
-    "iOS17",
-    "--latent-h",
-    "96",
-    "--latent-w",
-    "96",
-    "--chunk-unet"
+    "iOS17"
 ]
 
 

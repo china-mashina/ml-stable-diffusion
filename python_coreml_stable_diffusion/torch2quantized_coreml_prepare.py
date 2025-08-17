@@ -13,10 +13,11 @@ import pickle
 import operator
 from collections import OrderedDict
 from copy import deepcopy
-
+import re
 import coremltools as ct
 import numpy as np
 import torch
+from tqdm import tqdm
 from coremltools.optimize.torch.quantization import (
     LinearQuantizer,
     LinearQuantizerConfig,
@@ -121,6 +122,7 @@ def generate_calibration_data(pipe, args, calibration_dir):
         NEGATIVE_CALIBRATION_DATA if not getattr(args, "test", False) else NEGATIVE_CALIBRATION_DATA[:1]
     )
 
+    
     for prompt, negative_prompt in zip(prompts, negative_prompts):
         gen = torch.manual_seed(args.seed)
         pipe(
@@ -130,7 +132,9 @@ def generate_calibration_data(pipe, args, calibration_dir):
             num_inference_steps=4,
             guidance_scale=0,
         )
-        filename = "_".join(prompt.split(" ")) + "_" + str(args.seed) + ".pkl"
+        safe_prompt = re.sub(r"[^\w\- ]", "", prompt)
+        safe_prompt = "_".join(safe_prompt.split())[:50]
+        filename = f"{safe_prompt}.pkl"
         filepath = os.path.join(calibration_dir, filename)
         with open(filepath, "wb") as f:
             pickle.dump(unet_inputs, f)
@@ -173,6 +177,18 @@ def unet_data_loader(data_dir, device="cpu", calibration_nsamples=None):
     logger.info(f"Total calibration samples: {len(dataloader)}")
     return dataloader
 
+def get_quantizable_modules(unet):
+    """Return list of leaf modules that can be quantized."""
+
+    quantizable_modules = []
+    for name, module in unet.named_modules():
+        if len(list(module.children())) > 0:
+            continue
+        if isinstance(module, torch.nn.Conv2d):
+            quantizable_modules.append(("conv", name))
+        if isinstance(module, Einsum):
+            quantizable_modules.append(("einsum", name))
+    return quantizable_modules
 
 def quantize_cumulative_config(skip_conv_layers, skip_einsum_layers):
     """Return LinearQuantizerConfig for W8A8 quantization."""
@@ -285,6 +301,21 @@ def _prepare_calibration(pipe, args, calib_dir):
             _log_device(f"Calibration sample[0] tensor {i}", t)
     return dataloader
 
+def should_keep_fp16(mtype: str, name: str) -> bool:
+    if mtype == "einsum":
+        return True  # not quantized as conv/linear weights
+    if name in {"conv_in", "conv_out"}:
+        return True
+    if name.startswith("time_embedding.") or name.startswith("add_embedding."):
+        return True
+    if ".time_emb_proj" in name:
+        return True
+    if ".conv_shortcut" in name:
+        return True
+    # Cross-attention K/V
+    if ".attn2." in name and (".to_k" in name or ".to_v" in name):
+        return True
+    return False
 
 def convert_quantized_unet(pipe, args):
     """Quantize ``pipe.unet`` and convert it to Core ML."""
@@ -342,7 +373,8 @@ def convert_quantized_unet(pipe, args):
         hidden_size = pipe.text_encoder_2.config.hidden_size
         te2_hidden_size = pipe.text_encoder_2.config.hidden_size
         del pipe.text_encoder_2
-
+    
+    
     # Delete pipeline UNet and drop the pipeline reference to free memory before
     # quantization. The caller should ensure there are no remaining references
     # to the pipeline after this call.
@@ -351,7 +383,19 @@ def convert_quantized_unet(pipe, args):
     gc.collect()
 
     # Quantize UNet weights and activations (W8A8 by default)
-    config = quantize_cumulative_config(set(), set())
+    skipped_conv_layers = set()
+    skipped_einsum_layers = set()
+    
+    quantizable_modules = get_quantizable_modules(reference_unet)
+    
+    for module_type, module_name in tqdm(quantizable_modules):
+        if should_keep_fp16(module_type, module_name):
+            if module_type == "einsum":
+                skipped_einsum_layers.add(module_name)
+            else:
+                skipped_conv_layers.add(module_name)
+    
+    config = quantize_cumulative_config(skipped_conv_layers, skipped_einsum_layers)
     logger.info("Quantizing UNet model")
 
     # Quantization must run on CPU. Keeping the resulting model on the same
