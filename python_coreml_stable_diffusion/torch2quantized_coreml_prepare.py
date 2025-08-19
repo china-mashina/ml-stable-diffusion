@@ -66,6 +66,18 @@ if len(NEGATIVE_CALIBRATION_DATA) != len(CALIBRATION_DATA):
         "negative_prompts.txt must contain the same number of lines as prompts.txt"
     )
 
+# Prompts used for PSNR evaluation.
+with open("psnr_prompts.txt", "r", encoding="utf-8") as f:
+    PSNR_PROMPTS = [line.strip() for line in f.readlines()]
+
+with open("psnr_negative_prompts.txt", "r", encoding="utf-8") as f:
+    NEGATIVE_PSNR_PROMPTS = [line.strip() for line in f.readlines()]
+
+if len(NEGATIVE_PSNR_PROMPTS) != len(PSNR_PROMPTS):
+    raise ValueError(
+        "psnr_negative_prompts.txt must contain the same number of lines as psnr_prompts.txt"
+    )
+
 
 def register_input_log_hook(unet, inputs):
     """Register forward pre hook to save model inputs.
@@ -142,6 +154,49 @@ def generate_calibration_data(pipe, args, calibration_dir):
     handle.remove()
 
 
+def generate_psnr_data(pipe, args, psnr_dir):
+    """Run prompts through pipeline and store UNet inputs for PSNR evaluation."""
+
+    unet_inputs = []
+    handle = register_input_log_hook(pipe.unet, unet_inputs)
+
+    pipe.scheduler.set_timesteps(4)
+    pipe.scheduler.timesteps = torch.tensor(
+        [999, 749, 499, 249], device=pipe.scheduler.timesteps.device
+    )
+
+    os.makedirs(psnr_dir, exist_ok=True)
+    for f in os.listdir(psnr_dir):
+        if f.endswith(".pkl"):
+            os.remove(os.path.join(psnr_dir, f))
+
+    prompts = PSNR_PROMPTS if not getattr(args, "test", False) else PSNR_PROMPTS[:1]
+    negative_prompts = (
+        NEGATIVE_PSNR_PROMPTS
+        if not getattr(args, "test", False)
+        else NEGATIVE_PSNR_PROMPTS[:1]
+    )
+
+    for prompt, negative_prompt in zip(prompts, negative_prompts):
+        gen = torch.manual_seed(args.seed)
+        pipe(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            generator=gen,
+            num_inference_steps=4,
+            guidance_scale=0,
+        )
+        safe_prompt = re.sub(r"[^\w\- ]", "", prompt)
+        safe_prompt = "_".join(safe_prompt.split())[:50]
+        filename = f"{safe_prompt}.pkl"
+        filepath = os.path.join(psnr_dir, filename)
+        with open(filepath, "wb") as f:
+            pickle.dump(unet_inputs, f)
+        unet_inputs.clear()
+
+    handle.remove()
+
+
 def unet_data_loader(data_dir, device="cpu", calibration_nsamples=None):
     """Load serialized UNet inputs from calibration directory."""
 
@@ -175,6 +230,22 @@ def unet_data_loader(data_dir, device="cpu", calibration_nsamples=None):
 
     logger.info(f"Total calibration samples: {len(dataloader)}")
     return dataloader
+
+
+def unet_data_generator(data_dir, device="cpu"):
+    """Yield serialized UNet inputs one at a time from directory."""
+
+    for file in sorted(os.listdir(data_dir)):
+        if file.endswith(".pkl"):
+            filepath = os.path.join(data_dir, file)
+            with open(filepath, "rb") as data:
+                try:
+                    while True:
+                        unet_data = pickle.load(data)
+                        for inp in unet_data:
+                            yield [x.to(torch.float32).to(device) for x in inp]
+                except EOFError:
+                    pass
 
 
 def get_quantizable_modules(unet):
@@ -343,6 +414,10 @@ def convert_quantized_unet(pipe, args):
     calib_dir = os.path.join(args.o, "calibration_data")
     dataloader = _prepare_calibration(pipe, args, calib_dir)
 
+    # Generate PSNR data using provided prompts
+    psnr_dir = os.path.join(args.o, "psnr_data")
+    generate_psnr_data(pipe, args, psnr_dir)
+
     # Create a reference UNet and gather text encoder metadata before
     # releasing the pipeline to free memory.
     if args.xl_version:
@@ -353,6 +428,13 @@ def convert_quantized_unet(pipe, args):
     # Move pipeline UNet to CPU before collecting weights to avoid mixed
     # device tensors in the reference model.
     pipe.unet.to("cpu")
+
+    # Keep a copy of original UNet for PSNR comparison
+    original_unet = unet_cls(
+        support_controlnet=args.unet_support_controlnet, **pipe.unet.config
+    ).eval()
+    original_unet.load_state_dict(pipe.unet.state_dict())
+    original_unet.to("cpu")
 
     reference_unet = unet_cls(
         support_controlnet=args.unet_support_controlnet, **pipe.unet.config
@@ -410,6 +492,27 @@ def convert_quantized_unet(pipe, args):
     del reference_unet, dataloader
     gc.collect()
     _log_device("Quantized UNet", quant_unet)
+
+    # Compute PSNR between original and quantized UNet outputs
+    original_unet.to(quant_device)
+    psnr_values = []
+    for idx, data in enumerate(unet_data_generator(psnr_dir, quant_device)):
+        original_unet_output = original_unet(*data)[0]
+        quantized_unet_output = quant_unet(*_to_coreml_unet_inputs(*data))
+        psnr = torch2coreml.compute_psnr(
+            original_unet_output.detach().cpu().numpy(),
+            quantized_unet_output.detach().cpu().numpy(),
+        )
+        psnr_values.append(psnr)
+        logger.info(f"PSNR sample {idx}: {psnr}")
+        del original_unet_output, quantized_unet_output
+
+    if psnr_values:
+        avg_psnr = sum(psnr_values) / len(psnr_values)
+        logger.info(f"Average PSNR: {avg_psnr}")
+
+    del original_unet
+    gc.collect()
 
     # Prepare sample input shapes
     batch_size = 1 if args.unet_batch_one else 2
