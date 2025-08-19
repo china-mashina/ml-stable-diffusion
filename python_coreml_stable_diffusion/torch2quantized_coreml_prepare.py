@@ -5,14 +5,12 @@
 #
 """Quantize Stable Diffusion XL UNet and convert the pipeline to Core ML."""
 
-import argparse
 import gc
 import logging
 import os
 import pickle
 import operator
 from collections import OrderedDict
-from copy import deepcopy
 import re
 import coremltools as ct
 import numpy as np
@@ -119,10 +117,11 @@ def generate_calibration_data(pipe, args, calibration_dir):
         CALIBRATION_DATA if not getattr(args, "test", False) else CALIBRATION_DATA[:1]
     )
     negative_prompts = (
-        NEGATIVE_CALIBRATION_DATA if not getattr(args, "test", False) else NEGATIVE_CALIBRATION_DATA[:1]
+        NEGATIVE_CALIBRATION_DATA
+        if not getattr(args, "test", False)
+        else NEGATIVE_CALIBRATION_DATA[:1]
     )
 
-    
     for prompt, negative_prompt in zip(prompts, negative_prompts):
         gen = torch.manual_seed(args.seed)
         pipe(
@@ -177,6 +176,7 @@ def unet_data_loader(data_dir, device="cpu", calibration_nsamples=None):
     logger.info(f"Total calibration samples: {len(dataloader)}")
     return dataloader
 
+
 def get_quantizable_modules(unet):
     """Return list of leaf modules that can be quantized."""
 
@@ -189,6 +189,7 @@ def get_quantizable_modules(unet):
         if isinstance(module, Einsum):
             quantizable_modules.append(("einsum", name))
     return quantizable_modules
+
 
 def quantize_cumulative_config(skip_conv_layers, skip_einsum_layers):
     """Return LinearQuantizerConfig for W8A8 quantization."""
@@ -301,6 +302,7 @@ def _prepare_calibration(pipe, args, calib_dir):
             _log_device(f"Calibration sample[0] tensor {i}", t)
     return dataloader
 
+
 def should_keep_fp16(mtype: str, name: str) -> bool:
     if mtype == "einsum":
         return True  # not quantized as conv/linear weights
@@ -316,6 +318,7 @@ def should_keep_fp16(mtype: str, name: str) -> bool:
     if ".attn2." in name and (".to_k" in name or ".to_v" in name):
         return True
     return False
+
 
 def convert_quantized_unet(pipe, args):
     """Quantize ``pipe.unet`` and convert it to Core ML."""
@@ -337,9 +340,7 @@ def convert_quantized_unet(pipe, args):
         return
 
     # Calibration data
-    calib_dir = os.path.join(
-        args.o, f"calibration_data"
-    )
+    calib_dir = os.path.join(args.o, "calibration_data")
     dataloader = _prepare_calibration(pipe, args, calib_dir)
 
     # Create a reference UNet and gather text encoder metadata before
@@ -373,8 +374,7 @@ def convert_quantized_unet(pipe, args):
         hidden_size = pipe.text_encoder_2.config.hidden_size
         te2_hidden_size = pipe.text_encoder_2.config.hidden_size
         del pipe.text_encoder_2
-    
-    
+
     # Delete pipeline UNet and drop the pipeline reference to free memory before
     # quantization. The caller should ensure there are no remaining references
     # to the pipeline after this call.
@@ -385,16 +385,16 @@ def convert_quantized_unet(pipe, args):
     # Quantize UNet weights and activations (W8A8 by default)
     skipped_conv_layers = set()
     skipped_einsum_layers = set()
-    
+
     quantizable_modules = get_quantizable_modules(reference_unet)
-    
+
     for module_type, module_name in tqdm(quantizable_modules):
         if should_keep_fp16(module_type, module_name):
             if module_type == "einsum":
                 skipped_einsum_layers.add(module_name)
             else:
                 skipped_conv_layers.add(module_name)
-    
+
     config = quantize_cumulative_config(skipped_conv_layers, skipped_einsum_layers)
     logger.info("Quantizing UNet model")
 
@@ -419,7 +419,6 @@ def convert_quantized_unet(pipe, args):
         args.latent_h or quant_unet.config.sample_size,
         args.latent_w or quant_unet.config.sample_size,
     )
-
 
     encoder_hidden_states_shape = (
         batch_size,
@@ -519,6 +518,7 @@ def convert_quantized_unet(pipe, args):
         args.merge_chunks_in_pipeline_model = False
         chunk_mlprogram.main(args)
 
+
 def chunk_unet(args):
     out_path = torch2coreml._get_out_path(args, "unet")
     unet_chunks_exist = all(
@@ -531,16 +531,17 @@ def chunk_unet(args):
         args.remove_original = False
         args.merge_chunks_in_pipeline_model = False
         chunk_mlprogram.main(args)
-        
+
+
 def main(args):
     os.makedirs(args.o, exist_ok=True)
 
     # Load diffusers pipeline as in torch2coreml
     pipe = torch2coreml.get_pipeline(args)
-    if torch.cuda.is_available():
-        pipe.to(device="cuda", dtype=torch.float32)
-    elif torch.backends.mps.is_available():
+    if torch.backends.mps.is_available():
         pipe.to(device="mps", dtype=torch.float32)
+    elif torch.cuda.is_available():
+        pipe.to(device="cuda", dtype=torch.float32)
     else:
         pipe.to(device="cpu", dtype=torch.float32)
     _log_device("Pipeline", pipe)
@@ -555,12 +556,12 @@ def main(args):
     unet_mod.ATTENTION_IMPLEMENTATION_IN_EFFECT = unet_mod.AttentionImplementations[
         args.attention_implementation
     ]
-    
+
     if args.convert_unet:
         convert_quantized_unet(pipe, args)
         del pipe
         gc.collect()
-    
+
     if args.chunk_unet:
         chunk_unet(args)
 
@@ -587,5 +588,3 @@ def parser_spec():
         help="Run calibration data generation on a single prompt",
     )
     return parser
-
-
