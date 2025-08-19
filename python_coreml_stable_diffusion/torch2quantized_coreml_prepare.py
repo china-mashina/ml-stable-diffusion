@@ -324,6 +324,10 @@ def quantize(model, config, calibration_data):
     quantized_model = quantizer.finalize()
     quantized_model.to(device)
     _log_device("Quantized model", quantized_model)
+    # Explicitly release heavy helpers to reduce peak memory before returning.
+    del prepared_model, quantizer, sample_input
+    gc.collect()
+    _log_process_memory("After quantizer finalize cleanup")
     return quantized_model
 
 
@@ -435,6 +439,8 @@ def convert_quantized_unet(pipe, args):
     del pipe.unet
     del pipe
     gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # Quantize UNet weights and activations (W8A8 by default)
     skipped_conv_layers = set()
@@ -472,6 +478,8 @@ def convert_quantized_unet(pipe, args):
         config,
     )
     gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     _log_process_memory("After quantization cleanup")
     _log_device("Quantized UNet", quant_unet)
 
