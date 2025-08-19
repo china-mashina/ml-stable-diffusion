@@ -539,17 +539,20 @@ def convert_quantized_unet(pipe, args):
     for idx, (args, kwargs) in enumerate(
         unet_data_generator(psnr_dir, quant_device)
     ):
-        original_unet_output = original_unet(*args, **kwargs)[0]
-        quantized_unet_output = quant_unet(
-            *_to_coreml_unet_inputs(*args, **kwargs)
-        )
+        coreml_inputs = _to_coreml_unet_inputs(*args, **kwargs)
+        original_unet_output = original_unet(*coreml_inputs)
+        if isinstance(original_unet_output, (tuple, list)):
+            original_unet_output = original_unet_output[0]
+        quantized_unet_output = quant_unet(*coreml_inputs)
+        if isinstance(quantized_unet_output, (tuple, list)):
+            quantized_unet_output = quantized_unet_output[0]
         psnr = torch2coreml.compute_psnr(
             original_unet_output.detach().cpu().numpy(),
             quantized_unet_output.detach().cpu().numpy(),
         )
         psnr_values.append(psnr)
         logger.info(f"PSNR sample {idx}: {psnr}")
-        del original_unet_output, quantized_unet_output
+        del original_unet_output, quantized_unet_output, coreml_inputs
 
     if psnr_values:
         avg_psnr = sum(psnr_values) / len(psnr_values)
