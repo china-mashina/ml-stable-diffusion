@@ -59,6 +59,33 @@ def _log_process_memory(label: str) -> None:
     logger.info(f"{label} RSS: {mem:.2f} GB")
 
 
+def _log_live_tensors(label: str, top_k: int = 20) -> None:
+    """Log the largest live tensors tracked by the garbage collector."""
+    tensors = []
+    for obj in gc.get_objects():
+        try:
+            if torch.is_tensor(obj):
+                size = obj.nelement() * obj.element_size()
+                tensors.append((size, obj))
+        except Exception:
+            continue
+
+    tensors.sort(key=lambda x: x[0], reverse=True)
+    total = sum(size for size, _ in tensors)
+    logger.info(
+        f"{label} total tensor memory: {total / (1024 ** 3):.2f} GB"
+    )
+    for idx, (size, tensor) in enumerate(tensors[:top_k]):
+        logger.info(
+            "tensor[%d] %.4f GB %s %s %s",
+            idx,
+            size / (1024 ** 3),
+            list(tensor.shape),
+            tensor.dtype,
+            tensor.device,
+        )
+
+
 def _model_size_gb(model: torch.nn.Module) -> float:
     """Approximate size of a model's parameters and buffers in GB."""
     param_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
@@ -481,6 +508,7 @@ def convert_quantized_unet(pipe, args):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     _log_process_memory("After quantization cleanup")
+    _log_live_tensors("After quantization cleanup")
     _log_device("Quantized UNet", quant_unet)
 
     # Prepare sample input shapes
@@ -548,6 +576,7 @@ def convert_quantized_unet(pipe, args):
         f"Sample inputs size: {_tensor_dict_size_gb(sample_inputs):.4f} GB"
     )
     _log_process_memory("Before JIT trace")
+    _log_live_tensors("Before JIT trace")
     mem = psutil.virtual_memory()
     logger.info(
         "Total: %.2f GB, Available: %.2f GB, Used: %.2f GB, Free: %.2f GB"
@@ -563,6 +592,7 @@ def convert_quantized_unet(pipe, args):
     traced_unet = torch.jit.trace(quant_unet, list(sample_inputs.values()))
     _log_device("Traced UNet", traced_unet)
     _log_process_memory("After JIT trace")
+    _log_live_tensors("After JIT trace")
 
     coreml_inputs = {k: v.numpy().astype(np.float32) for k, v in sample_inputs.items()}
     coreml_unet, out_path = torch2coreml._convert_to_coreml(
