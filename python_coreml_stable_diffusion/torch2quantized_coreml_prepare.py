@@ -409,6 +409,12 @@ def convert_quantized_unet(pipe, args):
     # reference_unet and calibration data are no longer needed
     del reference_unet, dataloader
     gc.collect()
+
+    # Save quantized UNet to reuse later if Core ML conversion fails
+    quant_unet_dir = os.path.join(args.o, "sdxl_quantized_unet")
+    quant_unet.save_pretrained(quant_unet_dir)
+    logger.info(f"Saved quantized UNet weights to {quant_unet_dir}")
+
     _log_device("Quantized UNet", quant_unet)
 
     # Prepare sample input shapes
