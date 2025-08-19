@@ -14,6 +14,7 @@ import operator
 from collections import OrderedDict
 from copy import deepcopy
 import re
+import ctypes
 import psutil
 import coremltools as ct
 import numpy as np
@@ -57,6 +58,18 @@ def _log_process_memory(label: str) -> None:
     proc = psutil.Process(os.getpid())
     mem = proc.memory_info().rss / (1024 ** 3)
     logger.info(f"{label} RSS: {mem:.2f} GB")
+
+
+def _release_memory(label: str) -> None:
+    """Best-effort attempt to return free memory to the OS."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    try:  # pragma: no cover - platform dependent
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+    _log_process_memory(label)
 
 
 def _log_live_tensors(label: str, top_k: int = 20) -> None:
@@ -353,8 +366,7 @@ def quantize(model, config, calibration_data):
     _log_device("Quantized model", quantized_model)
     # Explicitly release heavy helpers to reduce peak memory before returning.
     del prepared_model, quantizer, sample_input
-    gc.collect()
-    _log_process_memory("After quantizer finalize cleanup")
+    _release_memory("After quantizer finalize cleanup")
     return quantized_model
 
 
@@ -401,7 +413,7 @@ def convert_quantized_unet(pipe, args):
     if args.chunk_unet and unet_chunks_exist:
         logger.info("`unet` chunks already exist, skipping conversion.")
         del pipe.unet
-        gc.collect()
+        _release_memory("Skipped existing UNet chunks")
         return
 
     if os.path.exists(out_path):
@@ -465,9 +477,7 @@ def convert_quantized_unet(pipe, args):
     # to the pipeline after this call.
     del pipe.unet
     del pipe
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    _release_memory("After dropping pipeline")
 
     # Quantize UNet weights and activations (W8A8 by default)
     skipped_conv_layers = set()
@@ -504,12 +514,15 @@ def convert_quantized_unet(pipe, args):
         quantizable_modules,
         config,
     )
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    _log_process_memory("After quantization cleanup")
+    _release_memory("After quantization cleanup")
     _log_live_tensors("After quantization cleanup")
     _log_device("Quantized UNet", quant_unet)
+    rss = psutil.Process(os.getpid()).memory_info().rss / (1024 ** 3)
+    logger.info(
+        "Quantized UNet size: %.2f GB, process RSS: %.2f GB",
+        _model_size_gb(quant_unet),
+        rss,
+    )
 
     # Prepare sample input shapes
     batch_size = 1 if args.unet_batch_one else 2
@@ -628,8 +641,7 @@ def convert_quantized_unet(pipe, args):
     _log_process_memory("After saving CoreML model")
 
     del quant_unet, traced_unet, coreml_unet
-    gc.collect()
-    _log_process_memory("After deleting temporary models")
+    _release_memory("After deleting temporary models")
 
     if args.chunk_unet and not unet_chunks_exist:
         logger.info("Chunking unet in two approximately equal MLModels")
@@ -678,7 +690,7 @@ def main(args):
     if args.convert_unet:
         convert_quantized_unet(pipe, args)
         del pipe
-        gc.collect()
+        _release_memory("After UNet conversion")
     
     if args.chunk_unet:
         chunk_unet(args)
