@@ -12,3 +12,6 @@ ssh-add ~/.ssh/id_ed25519          # enter passphrase once
 ssh -T git@github.com              # should say “Hi USERNAME!”
 git push
 
+xcrun coremlc compile Stable_Diffusion_unet.mlpackage Resources
+
+python -m python_coreml_stable_diffusion.chunk_mlprogram --mlpackage-path '/Users/shynggys/Documents/ml-stable-diffusion/output/chunks/Stable_Diffusion_unet_chunk2.mlpackage' -o '/Users/shynggys/Documents/ml-stable-diffusion/output/chunks'
