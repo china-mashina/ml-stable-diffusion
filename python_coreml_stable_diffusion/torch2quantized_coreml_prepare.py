@@ -13,6 +13,7 @@ import pickle
 import operator
 from collections import OrderedDict
 import re
+import json
 import coremltools as ct
 import numpy as np
 import torch
@@ -391,6 +392,26 @@ def convert_quantized_unet(pipe, args):
     del pipe.unet
     del pipe
     gc.collect()
+
+    # Apply weight palettization before activation quantization for accurate calibration
+    if getattr(args, "pre_analysis_json_path", None) and getattr(
+        args, "selected_recipe", None
+    ):
+        logger.info("Applying mixed-bit weight quantization before activation quantization")
+        from python_coreml_stable_diffusion.mixed_bit_compression_pre_analysis import (
+            fake_palette_from_recipe,
+        )
+
+        with open(args.pre_analysis_json_path, "r", encoding="utf-8") as f:
+            pre_analysis = json.load(f)
+        if args.selected_recipe not in pre_analysis["recipes"]:
+            raise KeyError(
+                f"--selected-recipe ({args.selected_recipe}) not found in "
+                f"--pre-analysis-json-path ({args.pre_analysis_json_path}). "
+                f"Available recipes: {list(pre_analysis['recipes'])}"
+            )
+        recipe = pre_analysis["recipes"][args.selected_recipe]
+        fake_palette_from_recipe(reference_unet, recipe)
 
     # Quantize UNet activations to 8-bit while keeping weights in float16.
     skipped_conv_layers = set()
