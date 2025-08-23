@@ -208,7 +208,7 @@ def quantize_cumulative_config(skip_conv_layers, skip_einsum_layers):
     skip_config = ModuleLinearQuantizerConfig(
         quantization_scheme="symmetric",
         milestones=[0, 1000, 1000, 0],
-        weight_dtype=torch.float16,
+        weight_dtype=torch.float32,
         activation_dtype=torch.float32,
     )
 
@@ -222,7 +222,8 @@ def quantize_cumulative_config(skip_conv_layers, skip_einsum_layers):
         global_config=ModuleLinearQuantizerConfig(
             quantization_scheme="symmetric",
             milestones=[0, 1000, 1000, 0],
-            weight_dtype=torch.float16,
+            weight_dtype=torch.float32,
+            activation_dtype=torch.quint8,
         ),
         module_name_configs=module_name_config,
         module_type_configs={
@@ -312,7 +313,7 @@ def _prepare_calibration(pipe, args, calib_dir):
     return dataloader
 
 
-def should_keep_fp16(mtype: str, name: str) -> bool:
+def should_skip_weight_quantization(mtype: str, name: str) -> bool:
     if mtype == "einsum":
         return True  # not quantized as conv/linear weights
     if name in {"conv_in", "conv_out"}:
@@ -398,7 +399,7 @@ def convert_quantized_unet(pipe, args):
     quantizable_modules = get_quantizable_modules(reference_unet)
 
     for module_type, module_name in tqdm(quantizable_modules):
-        if should_keep_fp16(module_type, module_name):
+        if should_skip_weight_quantization(module_type, module_name):
             if module_type == "einsum":
                 skipped_einsum_layers.add(module_name)
             else:
