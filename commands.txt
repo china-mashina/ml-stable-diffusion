@@ -14,4 +14,9 @@ git push
 
 xcrun coremlc compile Stable_Diffusion_unet.mlpackage Resources
 
-python -m python_coreml_stable_diffusion.chunk_mlprogram --mlpackage-path '/Users/shynggys/Documents/ml-stable-diffusion/output/chunks/Stable_Diffusion_unet_chunk2.mlpackage' -o '/Users/shynggys/Documents/ml-stable-diffusion/output/chunks'
+python -m python_coreml_stable_diffusion.chunk_mlprogram --mlpackage-path '/Users/shynggys/Documents/ML/ml-stable-diffusion/output/chunks/Stable_Diffusion_unet_chunk2.mlpackage' -o '/Users/shynggys/Documents/ML/ml-stable-diffusion/output/chunks
+
+
+python -m python_coreml_stable_diffusion.torch2coreml  --quantize-nbits 8 --convert-text-encoder --xl-version --model-version model --attention-implementation SPLIT_EINSUM -o output
+
+python -m python_coreml_stable_diffusion.chunk_mlprogram_original --mlpackage-path '/Users/shynggys/Documents/ML/ml-stable-diffusion/output/chunks/Stable_Diffusion_text_encoder_2_chunk1.mlpackage' -o '/Users/shynggys/Documents/ML/ml-stable-diffusion/output/chunks'
