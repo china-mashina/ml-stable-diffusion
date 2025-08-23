@@ -5,6 +5,7 @@
 #
 """Quantize Stable Diffusion XL UNet and convert the pipeline to Core ML."""
 
+import argparse
 import gc
 import logging
 import os
@@ -26,6 +27,7 @@ from python_coreml_stable_diffusion import (
     torch2coreml,
     unet as unet_mod,
     chunk_mlprogram,
+    mixed_bit_compression_apply,
 )
 from python_coreml_stable_diffusion.layer_norm import LayerNormANE
 from python_coreml_stable_diffusion.unet import Einsum
@@ -192,20 +194,26 @@ def get_quantizable_modules(unet):
 
 
 def quantize_cumulative_config(skip_conv_layers, skip_einsum_layers):
-    """Return LinearQuantizerConfig for W8A8 quantization."""
+    """Return LinearQuantizerConfig for A8 activation quantization.
+
+    We avoid quantizing weights here to allow a later mixed-bit
+    palettization step."""
 
     logger.info(
         f"Skipping {len(skip_conv_layers)} conv layers and {len(skip_einsum_layers)} einsum layers"
     )
 
-    w8config = ModuleLinearQuantizerConfig(
+    # Layers in ``skip_*`` collections keep weights and activations in
+    # floating point precision.
+    skip_config = ModuleLinearQuantizerConfig(
         quantization_scheme="symmetric",
         milestones=[0, 1000, 1000, 0],
+        weight_dtype=torch.float16,
         activation_dtype=torch.float32,
     )
 
-    conv_modules_config = {name: w8config for name in skip_conv_layers}
-    einsum_modules_config = {name: w8config for name in skip_einsum_layers}
+    conv_modules_config = {name: skip_config for name in skip_conv_layers}
+    einsum_modules_config = {name: skip_config for name in skip_einsum_layers}
     module_name_config = {}
     module_name_config.update(conv_modules_config)
     module_name_config.update(einsum_modules_config)
@@ -214,6 +222,7 @@ def quantize_cumulative_config(skip_conv_layers, skip_einsum_layers):
         global_config=ModuleLinearQuantizerConfig(
             quantization_scheme="symmetric",
             milestones=[0, 1000, 1000, 0],
+            weight_dtype=torch.float16,
         ),
         module_name_configs=module_name_config,
         module_type_configs={
@@ -382,7 +391,7 @@ def convert_quantized_unet(pipe, args):
     del pipe
     gc.collect()
 
-    # Quantize UNet weights and activations (W8A8 by default)
+    # Quantize UNet activations to 8-bit while keeping weights in float16.
     skipped_conv_layers = set()
     skipped_einsum_layers = set()
 
@@ -483,7 +492,7 @@ def convert_quantized_unet(pipe, args):
         coreml_inputs,
         ["noise_pred"],
         args,
-        precision=ct.precision.FLOAT32,
+        precision=ct.precision.FLOAT16,
     )
 
     coreml_unet.author = f"Please refer to the Model Card available at huggingface.co/{args.model_version}"
@@ -507,6 +516,21 @@ def convert_quantized_unet(pipe, args):
 
     coreml_unet.save(out_path)
     logger.info(f"Saved quantized unet into {out_path}")
+
+    # Apply mixed-bit weight palettization if a recipe is provided.
+    if getattr(args, "pre_analysis_json_path", None) and getattr(
+        args, "selected_recipe", None
+    ):
+        logger.info("Applying mixed-bit weight quantization")
+        mbc_args = argparse.Namespace(
+            o=out_path,
+            mlpackage_path=out_path,
+            pre_analysis_json_path=args.pre_analysis_json_path,
+            selected_recipe=args.selected_recipe,
+            model_version=args.model_version,
+            custom_vae_version=getattr(args, "custom_vae_version", None),
+        )
+        mixed_bit_compression_apply.main(mbc_args)
 
     del quant_unet, traced_unet, coreml_unet
     gc.collect()
@@ -586,5 +610,15 @@ def parser_spec():
         "--test",
         action="store_true",
         help="Run calibration data generation on a single prompt",
+    )
+    parser.add_argument(
+        "--pre-analysis-json-path",
+        type=str,
+        help="JSON from mixed_bit_compression_pre_analysis.py for weight quantization",
+    )
+    parser.add_argument(
+        "--selected-recipe",
+        type=str,
+        help="Recipe key within the pre-analysis JSON for mixed-bit quantization",
     )
     return parser
