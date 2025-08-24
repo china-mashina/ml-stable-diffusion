@@ -44,20 +44,38 @@ RANDOM_TEST_DATA = [
 
 TEST_RESOLUTION = 768
 
-RANDOM_TEST_IMAGE_DATA = [
-    Image.open(
-        requests.get(path, stream=True).raw).convert("RGB").resize(
-            (TEST_RESOLUTION, TEST_RESOLUTION), Image.LANCZOS
-    ) for path in [
-        "http://farm1.staticflickr.com/106/298138827_19bb723252_z.jpg",
-        "http://farm4.staticflickr.com/3772/9666116202_648cd752d6_z.jpg",
-        "http://farm3.staticflickr.com/2238/2472574092_f5534bb2f7_z.jpg",
-        "http://farm1.staticflickr.com/220/475442674_47d81fdc2c_z.jpg",
-        "http://farm8.staticflickr.com/7231/7359341784_4c5358197f_z.jpg",
-        "http://farm8.staticflickr.com/7283/8737653089_d0c77b8597_z.jpg",
-        "http://farm3.staticflickr.com/2454/3989339438_2f32b76ebb_z.jpg",
-        "http://farm1.staticflickr.com/34/123005230_13051344b1_z.jpg",
-]]
+RANDOM_TEST_IMAGE_URLS = [
+    "http://farm1.staticflickr.com/106/298138827_19bb723252_z.jpg",
+    "http://farm4.staticflickr.com/3772/9666116202_648cd752d6_z.jpg",
+    "http://farm3.staticflickr.com/2238/2472574092_f5534bb2f7_z.jpg",
+    "http://farm1.staticflickr.com/220/475442674_47d81fdc2c_z.jpg",
+    "http://farm8.staticflickr.com/7231/7359341784_4c5358197f_z.jpg",
+    "http://farm8.staticflickr.com/7283/8737653089_d0c77b8597_z.jpg",
+    "http://farm3.staticflickr.com/2454/3989339438_2f32b76ebb_z.jpg",
+    "http://farm1.staticflickr.com/34/123005230_13051344b1_z.jpg",
+]
+
+
+def _load_random_test_images():
+    images = []
+    for path in RANDOM_TEST_IMAGE_URLS:
+        try:
+            response = requests.get(path, stream=True, timeout=5)
+            img = Image.open(response.raw).convert("RGB").resize(
+                (TEST_RESOLUTION, TEST_RESOLUTION), Image.LANCZOS
+            )
+        except Exception as e:
+            logger.warning(f"Failed to load test image {path}: {e}. Using random data instead.")
+            arr = np.random.randint(
+                0, 256, size=(TEST_RESOLUTION, TEST_RESOLUTION, 3), dtype=np.uint8
+            )
+            img = Image.fromarray(arr, mode="RGB")
+        images.append(img)
+    return images
+
+
+# Lazily populated cache for image data
+RANDOM_TEST_IMAGE_DATA = None
 
 
 # Copied from https://github.com/apple/coremltools/blob/7.0b1/coremltools/optimize/coreml/_quantization_passes.py#L602
@@ -266,6 +284,9 @@ def run_pipe(pipe):
         generator=rng
     )
     if "Img2Img" in pipe.__class__.__name__:
+        global RANDOM_TEST_IMAGE_DATA
+        if RANDOM_TEST_IMAGE_DATA is None:
+            RANDOM_TEST_IMAGE_DATA = _load_random_test_images()
         kwargs["image"] = RANDOM_TEST_IMAGE_DATA
         kwargs.pop("height")
         kwargs.pop("width")

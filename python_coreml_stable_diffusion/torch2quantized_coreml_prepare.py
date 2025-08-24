@@ -5,6 +5,7 @@
 #
 """Quantize Stable Diffusion XL UNet and convert the pipeline to Core ML."""
 
+import argparse
 import gc
 import logging
 import os
@@ -12,9 +13,11 @@ import pickle
 import operator
 from collections import OrderedDict
 import re
+import json
 import coremltools as ct
 import numpy as np
 import torch
+import coremltools.optimize.coreml as cto
 from tqdm import tqdm
 from coremltools.optimize.torch.quantization import (
     LinearQuantizer,
@@ -33,6 +36,82 @@ from python_coreml_stable_diffusion.unet import Einsum
 logging.basicConfig()
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+
+# Bit-widths the Neural Engine is capable of accelerating
+NBITS = [1, 2, 4, 6, 8]
+
+# Minimum number of elements in a weight tensor to be considered for palettization
+PALETTIZE_MIN_SIZE = 1e5
+
+
+def _get_tensor_hash(tensor: np.ndarray) -> float:
+    """Hash float16 tensor by combining first element and size."""
+    assert tensor.dtype == np.float16
+    return tensor.ravel()[0] + np.prod(tensor.shape)
+
+
+def _fake_palettize(module: torch.nn.Module, nbits: int) -> None:
+    """Simulate palettization on a module's weights using k-means centers."""
+
+    from coremltools.models.neural_network.quantization_utils import (
+        _get_kmeans_lookup_table_and_weight,
+    )
+
+    dtype = module.weight.data.dtype
+    device = module.weight.data.device
+    val = module.weight.data.cpu().numpy().astype(np.float16)
+
+    lut, indices = _get_kmeans_lookup_table_and_weight(nbits, val)
+    lut = lut.astype(val.dtype)
+    indices = indices.astype(np.uint8)
+    module.weight.data = torch.from_numpy(lut[indices]).reshape(val.shape).to(dtype).to(device)
+
+
+def _apply_recipe_to_unet(unet: torch.nn.Module, recipe: dict) -> dict:
+    """Apply fake palettization according to recipe and return hashed recipe."""
+
+    hashed_recipe = {}
+    for name, submodule in unet.named_modules():
+        if not hasattr(submodule, "weight"):
+            continue
+        if name in recipe and recipe[name] != 16:
+            _fake_palettize(submodule, recipe[name])
+        weight = submodule.weight.detach().cpu().numpy().astype(np.float16)
+        hashed_recipe[_get_tensor_hash(weight)] = recipe.get(name, 16)
+    return hashed_recipe
+
+
+def _palettize_coreml_weights(mlpackage_path: str, hashed_recipe: dict) -> None:
+    """Palettize Core ML model weights based on hashed recipe."""
+
+    if not hashed_recipe:
+        return
+
+    coreml_model = ct.models.MLModel(mlpackage_path, compute_units=ct.ComputeUnit.CPU_ONLY)
+    weight_metadata = cto.get_weights_metadata(coreml_model, weight_threshold=PALETTIZE_MIN_SIZE)
+
+    hashes = np.array(list(hashed_recipe))
+    op_name_configs = {}
+    for name, metadata in weight_metadata.items():
+        tensor_hash = _get_tensor_hash(metadata.val.astype(np.float16))
+        pdist = np.abs(hashes - tensor_hash)
+        if pdist.min() >= 0.01:
+            continue
+        target_nbits = hashed_recipe[hashes[pdist.argmin()]]
+        if target_nbits == 16:
+            continue
+        op_name_configs[name] = cto.OpPalettizerConfig(
+            mode="kmeans", nbits=target_nbits, weight_threshold=int(PALETTIZE_MIN_SIZE)
+        )
+
+    if not op_name_configs:
+        return
+
+    config = ct.optimize.coreml.OptimizationConfig(op_name_configs=op_name_configs)
+    coreml_model = ct.optimize.coreml.palettize_weights(coreml_model, config)
+    coreml_model.save(mlpackage_path)
+
 
 
 def _log_device(name, obj):
@@ -192,20 +271,30 @@ def get_quantizable_modules(unet):
 
 
 def quantize_cumulative_config(skip_conv_layers, skip_einsum_layers):
-    """Return LinearQuantizerConfig for W8A8 quantization."""
+    """Return LinearQuantizerConfig for A8 activation quantization.
+
+    We avoid quantizing weights here to allow a later mixed-bit
+    palettization step."""
 
     logger.info(
         f"Skipping {len(skip_conv_layers)} conv layers and {len(skip_einsum_layers)} einsum layers"
     )
 
-    w8config = ModuleLinearQuantizerConfig(
+    # Layers in ``skip_*`` collections keep weights and activations in
+    # floating point precision.
+    # ``ModuleLinearQuantizerConfig`` only accepts ``float32`` or an int8 dtype
+    # for weights.  Using the string value ensures compatibility across
+    # different versions of ``coremltools`` where ``torch.float32`` may not be
+    # recognised.
+    skip_config = ModuleLinearQuantizerConfig(
         quantization_scheme="symmetric",
         milestones=[0, 1000, 1000, 0],
-        activation_dtype=torch.float32,
+        weight_dtype="float32",
+        activation_dtype="float32",
     )
 
-    conv_modules_config = {name: w8config for name in skip_conv_layers}
-    einsum_modules_config = {name: w8config for name in skip_einsum_layers}
+    conv_modules_config = {name: skip_config for name in skip_conv_layers}
+    einsum_modules_config = {name: skip_config for name in skip_einsum_layers}
     module_name_config = {}
     module_name_config.update(conv_modules_config)
     module_name_config.update(einsum_modules_config)
@@ -214,6 +303,8 @@ def quantize_cumulative_config(skip_conv_layers, skip_einsum_layers):
         global_config=ModuleLinearQuantizerConfig(
             quantization_scheme="symmetric",
             milestones=[0, 1000, 1000, 0],
+            weight_dtype="float32",
+            activation_dtype=torch.quint8,
         ),
         module_name_configs=module_name_config,
         module_type_configs={
@@ -303,7 +394,7 @@ def _prepare_calibration(pipe, args, calib_dir):
     return dataloader
 
 
-def should_keep_fp16(mtype: str, name: str) -> bool:
+def should_skip_weight_quantization(mtype: str, name: str) -> bool:
     if mtype == "einsum":
         return True  # not quantized as conv/linear weights
     if name in {"conv_in", "conv_out"}:
@@ -382,14 +473,34 @@ def convert_quantized_unet(pipe, args):
     del pipe
     gc.collect()
 
-    # Quantize UNet weights and activations (W8A8 by default)
+    # Apply weight palettization before activation quantization for accurate calibration
+    hashed_recipe = {}
+    if getattr(args, "pre_analysis_json_path", None) and getattr(
+        args, "selected_recipe", None
+    ):
+        logger.info(
+            "Applying mixed-bit weight quantization before activation quantization"
+        )
+        with open(args.pre_analysis_json_path, "r", encoding="utf-8") as f:
+            pre_analysis = json.load(f)
+        if args.selected_recipe not in pre_analysis["recipes"]:
+            raise KeyError(
+                f"--selected-recipe ({args.selected_recipe}) not found in "
+                f"--pre-analysis-json-path ({args.pre_analysis_json_path}). "
+                f"Available recipes: {list(pre_analysis['recipes'])}"
+            )
+        recipe = pre_analysis["recipes"][args.selected_recipe]
+        args.model_version = pre_analysis.get("model_version", args.model_version)
+        hashed_recipe = _apply_recipe_to_unet(reference_unet, recipe)
+
+    # Quantize UNet activations to 8-bit while keeping weights in float16.
     skipped_conv_layers = set()
     skipped_einsum_layers = set()
 
     quantizable_modules = get_quantizable_modules(reference_unet)
 
     for module_type, module_name in tqdm(quantizable_modules):
-        if should_keep_fp16(module_type, module_name):
+        if should_skip_weight_quantization(module_type, module_name):
             if module_type == "einsum":
                 skipped_einsum_layers.add(module_name)
             else:
@@ -483,7 +594,7 @@ def convert_quantized_unet(pipe, args):
         coreml_inputs,
         ["noise_pred"],
         args,
-        precision=ct.precision.FLOAT32,
+        precision=ct.precision.FLOAT16,
     )
 
     coreml_unet.author = f"Please refer to the Model Card available at huggingface.co/{args.model_version}"
@@ -507,6 +618,9 @@ def convert_quantized_unet(pipe, args):
 
     coreml_unet.save(out_path)
     logger.info(f"Saved quantized unet into {out_path}")
+
+    # Apply mixed-bit weight palettization if a recipe is provided.
+    _palettize_coreml_weights(out_path, hashed_recipe)
 
     del quant_unet, traced_unet, coreml_unet
     gc.collect()
@@ -586,5 +700,15 @@ def parser_spec():
         "--test",
         action="store_true",
         help="Run calibration data generation on a single prompt",
+    )
+    parser.add_argument(
+        "--pre-analysis-json-path",
+        type=str,
+        help="JSON from mixed_bit_compression_pre_analysis.py for weight quantization",
+    )
+    parser.add_argument(
+        "--selected-recipe",
+        type=str,
+        help="Recipe key within the pre-analysis JSON for mixed-bit quantization",
     )
     return parser
