@@ -555,6 +555,7 @@ def convert_quantized_unet(pipe, args):
             selected_recipe=args.selected_recipe,
             model_version=args.model_version,
             custom_vae_version=getattr(args, "custom_vae_version", None),
+            sd3_version=getattr(args, "sd3_version", False),
         )
         mixed_bit_compression_apply.main(mbc_args)
 
