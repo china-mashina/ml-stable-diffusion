@@ -206,11 +206,15 @@ def quantize_cumulative_config(skip_conv_layers, skip_einsum_layers):
 
     # Layers in ``skip_*`` collections keep weights and activations in
     # floating point precision.
+    # ``ModuleLinearQuantizerConfig`` only accepts ``float32`` or an int8 dtype
+    # for weights.  Using the string value ensures compatibility across
+    # different versions of ``coremltools`` where ``torch.float32`` may not be
+    # recognised.
     skip_config = ModuleLinearQuantizerConfig(
         quantization_scheme="symmetric",
         milestones=[0, 1000, 1000, 0],
-        weight_dtype=torch.float32,
-        activation_dtype=torch.float32,
+        weight_dtype="float32",
+        activation_dtype="float32",
     )
 
     conv_modules_config = {name: skip_config for name in skip_conv_layers}
@@ -223,7 +227,7 @@ def quantize_cumulative_config(skip_conv_layers, skip_einsum_layers):
         global_config=ModuleLinearQuantizerConfig(
             quantization_scheme="symmetric",
             milestones=[0, 1000, 1000, 0],
-            weight_dtype=torch.float32,
+            weight_dtype="float32",
             activation_dtype=torch.quint8,
         ),
         module_name_configs=module_name_config,
