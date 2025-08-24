@@ -17,6 +17,7 @@ import json
 import coremltools as ct
 import numpy as np
 import torch
+import coremltools.optimize.coreml as cto
 from tqdm import tqdm
 from coremltools.optimize.torch.quantization import (
     LinearQuantizer,
@@ -28,7 +29,6 @@ from python_coreml_stable_diffusion import (
     torch2coreml,
     unet as unet_mod,
     chunk_mlprogram,
-    mixed_bit_compression_apply,
 )
 from python_coreml_stable_diffusion.layer_norm import LayerNormANE
 from python_coreml_stable_diffusion.unet import Einsum
@@ -36,6 +36,82 @@ from python_coreml_stable_diffusion.unet import Einsum
 logging.basicConfig()
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+
+# Bit-widths the Neural Engine is capable of accelerating
+NBITS = [1, 2, 4, 6, 8]
+
+# Minimum number of elements in a weight tensor to be considered for palettization
+PALETTIZE_MIN_SIZE = 1e5
+
+
+def _get_tensor_hash(tensor: np.ndarray) -> float:
+    """Hash float16 tensor by combining first element and size."""
+    assert tensor.dtype == np.float16
+    return tensor.ravel()[0] + np.prod(tensor.shape)
+
+
+def _fake_palettize(module: torch.nn.Module, nbits: int) -> None:
+    """Simulate palettization on a module's weights using k-means centers."""
+
+    from coremltools.models.neural_network.quantization_utils import (
+        _get_kmeans_lookup_table_and_weight,
+    )
+
+    dtype = module.weight.data.dtype
+    device = module.weight.data.device
+    val = module.weight.data.cpu().numpy().astype(np.float16)
+
+    lut, indices = _get_kmeans_lookup_table_and_weight(nbits, val)
+    lut = lut.astype(val.dtype)
+    indices = indices.astype(np.uint8)
+    module.weight.data = torch.from_numpy(lut[indices]).reshape(val.shape).to(dtype).to(device)
+
+
+def _apply_recipe_to_unet(unet: torch.nn.Module, recipe: dict) -> dict:
+    """Apply fake palettization according to recipe and return hashed recipe."""
+
+    hashed_recipe = {}
+    for name, submodule in unet.named_modules():
+        if not hasattr(submodule, "weight"):
+            continue
+        if name in recipe and recipe[name] != 16:
+            _fake_palettize(submodule, recipe[name])
+        weight = submodule.weight.detach().cpu().numpy().astype(np.float16)
+        hashed_recipe[_get_tensor_hash(weight)] = recipe.get(name, 16)
+    return hashed_recipe
+
+
+def _palettize_coreml_weights(mlpackage_path: str, hashed_recipe: dict) -> None:
+    """Palettize Core ML model weights based on hashed recipe."""
+
+    if not hashed_recipe:
+        return
+
+    coreml_model = ct.models.MLModel(mlpackage_path, compute_units=ct.ComputeUnit.CPU_ONLY)
+    weight_metadata = cto.get_weights_metadata(coreml_model, weight_threshold=PALETTIZE_MIN_SIZE)
+
+    hashes = np.array(list(hashed_recipe))
+    op_name_configs = {}
+    for name, metadata in weight_metadata.items():
+        tensor_hash = _get_tensor_hash(metadata.val.astype(np.float16))
+        pdist = np.abs(hashes - tensor_hash)
+        if pdist.min() >= 0.01:
+            continue
+        target_nbits = hashed_recipe[hashes[pdist.argmin()]]
+        if target_nbits == 16:
+            continue
+        op_name_configs[name] = cto.OpPalettizerConfig(
+            mode="kmeans", nbits=target_nbits, weight_threshold=int(PALETTIZE_MIN_SIZE)
+        )
+
+    if not op_name_configs:
+        return
+
+    config = ct.optimize.coreml.OptimizationConfig(op_name_configs=op_name_configs)
+    coreml_model = ct.optimize.coreml.palettize_weights(coreml_model, config)
+    coreml_model.save(mlpackage_path)
+
 
 
 def _log_device(name, obj):
@@ -398,14 +474,13 @@ def convert_quantized_unet(pipe, args):
     gc.collect()
 
     # Apply weight palettization before activation quantization for accurate calibration
+    hashed_recipe = {}
     if getattr(args, "pre_analysis_json_path", None) and getattr(
         args, "selected_recipe", None
     ):
-        logger.info("Applying mixed-bit weight quantization before activation quantization")
-        from python_coreml_stable_diffusion.mixed_bit_compression_pre_analysis import (
-            fake_palette_from_recipe,
+        logger.info(
+            "Applying mixed-bit weight quantization before activation quantization"
         )
-
         with open(args.pre_analysis_json_path, "r", encoding="utf-8") as f:
             pre_analysis = json.load(f)
         if args.selected_recipe not in pre_analysis["recipes"]:
@@ -415,7 +490,8 @@ def convert_quantized_unet(pipe, args):
                 f"Available recipes: {list(pre_analysis['recipes'])}"
             )
         recipe = pre_analysis["recipes"][args.selected_recipe]
-        fake_palette_from_recipe(reference_unet, recipe)
+        args.model_version = pre_analysis.get("model_version", args.model_version)
+        hashed_recipe = _apply_recipe_to_unet(reference_unet, recipe)
 
     # Quantize UNet activations to 8-bit while keeping weights in float16.
     skipped_conv_layers = set()
@@ -544,20 +620,7 @@ def convert_quantized_unet(pipe, args):
     logger.info(f"Saved quantized unet into {out_path}")
 
     # Apply mixed-bit weight palettization if a recipe is provided.
-    if getattr(args, "pre_analysis_json_path", None) and getattr(
-        args, "selected_recipe", None
-    ):
-        logger.info("Applying mixed-bit weight quantization")
-        mbc_args = argparse.Namespace(
-            o=out_path,
-            mlpackage_path=out_path,
-            pre_analysis_json_path=args.pre_analysis_json_path,
-            selected_recipe=args.selected_recipe,
-            model_version=args.model_version,
-            custom_vae_version=getattr(args, "custom_vae_version", None),
-            sd3_version=getattr(args, "sd3_version", False),
-        )
-        mixed_bit_compression_apply.main(mbc_args)
+    _palettize_coreml_weights(out_path, hashed_recipe)
 
     del quant_unet, traced_unet, coreml_unet
     gc.collect()
