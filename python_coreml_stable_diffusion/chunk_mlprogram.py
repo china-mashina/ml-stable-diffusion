@@ -401,6 +401,34 @@ def _legacy_model_chunking(args):
         logger.info("Done.")
 
 
+def _recursive_chunk(index, count, base_name, args, path):
+    if count == 1:
+        dest = os.path.join(args.o, f"{base_name}_chunk{index}.mlpackage")
+        if path != dest:
+            shutil.move(path, dest)
+        return [dest]
+
+    temp_args = argparse.Namespace(
+        mlpackage_path=path,
+        o=args.o,
+        remove_original=False,
+        check_output_correctness=False,
+        merge_chunks_in_pipeline_model=False,
+    )
+    _legacy_model_chunking(temp_args)
+    name = os.path.splitext(os.path.basename(path))[0]
+    child1 = os.path.join(args.o, name + "_chunk1.mlpackage")
+    child2 = os.path.join(args.o, name + "_chunk2.mlpackage")
+    shutil.rmtree(path)
+    half = count // 2
+    i1 = index * 2 - 1
+    i2 = index * 2
+    chunks = []
+    chunks += _recursive_chunk(i1, half, base_name, args, child1)
+    chunks += _recursive_chunk(i2, half, base_name, args, child2)
+    return chunks
+
+
 def main(args):
     ct_version = ct.__version__
 
@@ -411,10 +439,37 @@ def main(args):
         f"coremltools version {ct_version} detected. Recommended upgrading the package version to "
         f"'8.0b2' when you running chunk_mlprogram.py script for the latest supports and bug fixes."
     )
-    _legacy_model_chunking(args)
 
-    # Remove original (non-chunked) model if requested
-    if args.remove_original:
+    os.makedirs(args.o, exist_ok=True)
+    base_name = os.path.splitext(os.path.basename(args.mlpackage_path))[0]
+    first_chunk = os.path.join(args.o, f"{base_name}_chunk1.mlpackage")
+    shutil.copytree(args.mlpackage_path, first_chunk)
+
+    final_chunks = _recursive_chunk(1, args.num_chunks, base_name, args, first_chunk)
+
+    for idx, path in enumerate(final_chunks, 1):
+        try:
+            torch2coreml._compile_coreml_model(
+                path, args.o, f"{args.mlmodelc_name}Chunk{idx}"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to compile chunk {idx}: {e}")
+
+    if args.check_output_correctness:
+        logger.info("Verifying output correctness of chunks")
+        full_model = ct.models.MLModel(
+            args.mlpackage_path, compute_units=ct.ComputeUnit.CPU_ONLY
+        )
+        models = [
+            ct.models.MLModel(p, compute_units=ct.ComputeUnit.CPU_ONLY)
+            for p in final_chunks
+        ]
+        pipeline_model = ct.utils.make_pipeline(*models)
+        _verify_output_correctness_of_chunks(
+            full_model=full_model, pipeline_model=pipeline_model
+        )
+
+    if args.remove_original and os.path.exists(args.mlpackage_path):
         logger.info(
             "Removing original (non-chunked) model at {args.mlpackage_path}")
         shutil.rmtree(args.mlpackage_path)
@@ -454,6 +509,18 @@ if __name__ == "__main__":
         help=
         ("If specified, model chunks are managed inside a single pipeline model for easier asset maintenance"
          ))
+    parser.add_argument(
+        "--num-chunks",
+        type=int,
+        default=2,
+        choices=[2, 4, 8, 16],
+        help="Number of chunks to split the model into (must be power of two up to 16).",
+    )
+    parser.add_argument(
+        "--mlmodelc-name",
+        default="Unet",
+        help="Base name to use for compiled .mlmodelc outputs.",
+    )
 
     args = parser.parse_args()
     main(args)
